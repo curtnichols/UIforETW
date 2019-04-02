@@ -12,16 +12,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+This script analyzes the specified trace to identify Chrome's processes by path
+and by type. It optionally prints information about the number of context
+switches by process and type, as well as CPU usage.
+"""
+
 from __future__ import print_function
 
-import sys
+import argparse
+import csv
 import os
 import re
+import subprocess
+import sys
 
 def main():
-  if len(sys.argv) < 2:
-    print("Usage: %s tracename" % sys.argv[0])
+  parser = argparse.ArgumentParser(description="Identify and categorize chrome processes in an ETW trace.")
+  parser.add_argument("trace", type=str, nargs=1, help="ETW trace to be processed")
+  parser.add_argument("-c", "--cpuusage", help="Summarize CPU usage and context switches per process", action="store_true")
+  args = parser.parse_args()
+
+  show_cpu_usage = args.cpuusage
+  tracename = args.trace[0]
+
+  if not os.path.exists(tracename):
+    print("Trace file '%s' does not exist." % tracename)
+    print("Usage: %s tracename [-cpuusage]" % sys.argv[0])
     sys.exit(0)
+
+  script_dir = os.path.dirname(sys.argv[0])
+  if len(script_dir) == 0:
+    script_dir = "."
+
+  cpu_usage_by_pid = {}
+  context_switches_by_pid = {}
+  if show_cpu_usage:
+    csv_filename = os.path.join(script_dir, "CPU_Usage_(Precise)_Randomascii_CPU_Summary_by_Process.csv")
+    profile_filename = os.path.join(script_dir, "CPUSummaryByProcess.wpaProfile")
+    try:
+      # Try to delete any old results files but continue if this fails.
+      os.remove(csv_filename)
+    except:
+      pass
+    command = 'wpaexporter "%s" -outputfolder "%s" -profile "%s"' % (tracename, script_dir, profile_filename)
+    output = str(subprocess.check_output(command, stderr=subprocess.STDOUT))
+    # Typical output in the .csv file looks like this:
+    # New Process,Count,CPU Usage (in view) (ms)
+    # Idle (0),7237,"26,420.482528"
+    # We can't just split on commas because the CPU Usage often has embedded commas so
+    # we need to use an actual csv reader.
+    if os.path.exists(csv_filename):
+      lines = open(csv_filename, "r").readlines()
+      process_and_pid_re = re.compile(r"(.*) \(([\d ]*)\)")
+      for row_parts in csv.reader(lines[1:], delimiter = ",", quotechar = '"', skipinitialspace=True):
+        process, context_switches, cpu_usage = row_parts
+        match = process_and_pid_re.match(process)
+        if match:
+          process_name, pid = match.groups()
+        else:
+          process_name, pid = "Unknown", "-1"
+        # We could record this for all processes, but this script is all about
+        # Chrome so I don't.
+        if process_name == "chrome.exe":
+          pid = int(pid)
+          cpu_usage_by_pid[pid] = float(cpu_usage.replace(",", ""))
+          context_switches_by_pid[pid] = int(context_switches)
+        elif process_name in ['dwm.exe', 'audiodg.exe', 'System', 'MsMpEng.exe',
+                              'software_reporter_tool.exe']:
+          # Print information about other relevant processes:
+          print("%11s - %6d context switches, %8.2f ms CPU\r" % (process_name,
+                int(context_switches), float(cpu_usage.replace(",", ""))))
+      print("\r")
+    else:
+      print("Expected output file not found.")
+      print("Expected to find: %s" % csv_filename)
+      print("Should have been produced by: %s" % command)
 
   # Typical output of -a process -withcmdline looks like:
   #        MIN,   24656403, Process, 0XA1141C60,       chrome.exe ( 748),      10760,          1, 0x11e8c260, "C:\...\chrome.exe" --type=renderer ...
@@ -29,9 +95,11 @@ def main():
   pidsRe = re.compile(r".*\(([\d ]*)\), *(\d*),.*")
   # Find the space-terminated word after 'type='. This used to require that it
   # be the first command-line option, but that is likely to not always be true.
-  processTypeRe = re.compile(r".* --type=([^ ]*) .*")
+  # Mark the first .* as lazy/ungreedy/reluctant so that if there are multiple
+  # --type options (such as with the V8 Proxy Resolver utility process) the
+  # first one will win.
+  processTypeRe = re.compile(r".*? --type=([^ ]*) .*")
 
-  tracename = sys.argv[1]
   #-tle = tolerate lost events
   #-tti = tolerate time ivnersions
   #-a process = show process, thread, image information (see xperf -help processing)
@@ -67,6 +135,10 @@ def main():
         match = processTypeRe.match(commandLine)
         if match:
           type = match.groups()[0]
+          if commandLine.count(" --extension-process ") > 0:
+            type = "extension"
+          if type == "crashpad-handler":
+            type = "crashpad" # Shorten the tag for better formatting
           browserPid = parentPid
         else:
           type = "browser"
@@ -79,13 +151,14 @@ def main():
         pidList.append(pid)
         pidsByType[type] = pidList
         pidsByParent[browserPid] = pidsByType
+
   # Scan a copy of the list of browser Pids looking for those with parents
   # in the list and no children. These represent child processes whose --type=
   # option was too far along in the command line for ETW's 512-character capture
   # to get. See crbug.com/614502 for how this happened.
   # This should probably be deleted at some point, along with the declaration and
   # initialization of lineByPid.
-  for pid in pathByBrowserPid.keys()[:]:
+  for pid in list(pathByBrowserPid.keys())[:]:
     # Checking that there is only one entry (itself) in the list is important
     # to avoid problems caused by Pid reuse that could cause one browser process
     # to appear to be another browser process' parent.
@@ -109,23 +182,81 @@ def main():
         del pathByBrowserPid[pid]
         del pidsByParent[pid]
 
-  print("Chrome PIDs by process type:\r")
-  for browserPid in pidsByParent.keys():
-    exePath = pathByBrowserPid[browserPid]
+  # In many cases there are two crash-handler processes and one is the
+  # parent of the other. This seems to be related to --monitor-self.
+  # This script will initially report the parent crashpad process as being a
+  # browser process, leaving the child orphaned. This fixes that up by
+  # looking for singleton crashpad browsers and then finding their real
+  # crashpad parent. This will then cause two crashpad processes to be
+  # listed, which is correct.
+  for browserPid in list(pidsByParent.keys()):
+    childPids = pidsByParent[browserPid]
+    if len(childPids) == 1 and 'crashpad' in childPids:
+      # Scan the list of child processes to see if this processes parent can be
+      # found, as one of the crashpad processes.
+      for innerBrowserPid in list(pidsByParent.keys()):
+        innerChildPids = pidsByParent[innerBrowserPid]
+        if 'crashpad' in innerChildPids and browserPid in innerChildPids['crashpad']:
+          # Append the orphaned crashpad process to the right list, then
+          # delete it from the list of browser processes.
+          innerChildPids['crashpad'].append(childPids['crashpad'][0])
+          del pidsByParent[browserPid]
+          # It's important to break out of this loop now that we have
+          # deleted an entry, or else we might try to look it up.
+          break
+
+  if len(pidsByParent.keys()) > 0:
+    print("Chrome PIDs by process type:\r")
+  else:
+    print("No Chrome processes found.\r")
+  for browserPid in list(pidsByParent.keys()):
+    # The crashpad fixes above should avoid this situation, but I'm leaving the
+    # check to maintain robustness.
+    exePath = pathByBrowserPid.get(browserPid, "Unknown parent")
     # Any paths with no entries in them should be ignored.
     pidsByType = pidsByParent[browserPid]
     if len(pidsByType) == 0:
       assert False
       continue
-    print("%s (%d)\r" % (exePath, browserPid))
     keys = list(pidsByType.keys())
     keys.sort()
+    total_processes = 0
+    total_context_switches = 0
+    total_cpu_usage = 0.0
+    for type in keys:
+      for pid in pidsByType[type]:
+        total_processes += 1
+        if show_cpu_usage and pid in cpu_usage_by_pid:
+          total_context_switches += context_switches_by_pid[pid]
+          total_cpu_usage += cpu_usage_by_pid[pid]
+    if show_cpu_usage:
+      print("%s (%d) - %d context switches, %8.2f ms CPU, %d processes\r" % (
+            exePath, browserPid, total_context_switches, total_cpu_usage,
+            total_processes))
+    else:
+      print("%s (%d) - %d processes\r" % (exePath, browserPid, total_processes))
     # Note the importance of printing the '\r' so that the
     # output will be compatible with Windows edit controls.
     for type in keys:
       print("    %-11s : " % type, end="")
-      for pid in pidsByType[type]:
-        print("%d " % pid, end="")
+      context_switches = 0
+      cpu_usage = 0.0
+      if show_cpu_usage:
+        for pid in pidsByType[type]:
+          if pid in cpu_usage_by_pid:
+            context_switches += context_switches_by_pid[pid]
+            cpu_usage += cpu_usage_by_pid[pid]
+        print("total - %6d context switches, %8.2f ms CPU" % (context_switches, cpu_usage), end="")
+      list_by_type = pidsByType[type]
+      for pid in list_by_type:
+        if show_cpu_usage:
+          print("\r\n        ", end="")
+          if pid in cpu_usage_by_pid: # Skip per-process details if there's only one.:
+            print("%5d - %6d context switches, %8.2f ms CPU" % (pid, context_switches_by_pid[pid], cpu_usage_by_pid[pid]), end="")
+          else:
+            print("%5d" % pid, end="")
+        else:
+          print("%d " % pid, end="")
       print("\r")
     print("\r")
 

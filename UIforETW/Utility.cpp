@@ -19,13 +19,14 @@ limitations under the License.
 #include <fstream>
 #include <direct.h>
 #include <ShlObj.h>
-
+#include <atlbase.h>
+#include <Shellapi.h>
 
 namespace {
 PCWSTR const kWPAStartupFileName = L"Startup.wpaProfile";
 PCWSTR const kChromeRegionsFileName = L"chrome_regions_of_interest.xml";
 
-void UnlockGlobalMemory(_In_ const HGLOBAL hmem)
+void UnlockGlobalMemory(_In_ const HGLOBAL hmem) noexcept
 {
 	const BOOL unlockRes = ::GlobalUnlock(hmem);
 	if (!unlockRes)
@@ -42,7 +43,9 @@ std::wstring GetDocumentsFolderPath()
 		FOLDERID_Documents, KF_FLAG_NO_ALIAS, NULL, &docsPathTemp.m_pData);
 	if (FAILED(docsPathResult))
 	{
+#ifdef OUTPUT_DEBUG_STRINGS
 		debugPrintf(L"SHGetKnownFolderPath (for Documents) failed to retrieve the path.\n");
+#endif
 		std::terminate();
 	}
 	return docsPathTemp.m_pData;
@@ -100,19 +103,34 @@ void copyWPAProfileToLocalAppData(const std::wstring& exeDir, const bool force)
 
 		ATLVERIFY(::CreateDirectoryW(destDir.c_str(), NULL) || ::GetLastError() == ERROR_ALREADY_EXISTS);
 
-		if (::CopyFileW(source.c_str(), dest.c_str(), FALSE))
+		const BOOL copyResult = ::CopyFileW(source.c_str(), dest.c_str(), FALSE);
+		if (force) // Print status of copy
 		{
-			if (force)
-				outputPrintf(L"%s", L"Copied Startup.10wpaProfile to %localappdata%\\Windows Performance Analyzer\n");
-			return;
+			if (copyResult)
+				outputPrintf(L"%s", L"Copied Startup10.wpaProfile to %localappdata%\\Windows Performance Analyzer\n");
+			else
+			{
+				outputPrintf(L"%s", L"Failed to copy Startup10.wpaProfile to %localappdata%\\Windows Performance Analyzer\n");
+				outputLastError();
+			}
 		}
-		if (force)
+
+		// This file holds modifications to presets that supersede the startup
+		// profile and therefore should be deleted when copying over a new
+		// startup profile.
+		const std::wstring presets = destDir + L"MyPresets.wpaPresets";
+		if (PathFileExistsW(presets.c_str()))
 		{
-			outputPrintf(L"%s", L"Failed to copy Startup.10wpaProfile to %localappdata%\\Windows Performance Analyzer\n");
-			outputLastError();
+			const int deleteResult = DeleteOneFile(NULL, presets);
+			if (force) // Print status of delete
+			{
+				if (deleteResult)
+					outputPrintf(L"%s", L"Failed to delete MyPresets.wpaPresets from %localappdata%\\Windows Performance Analyzer\n");
+				else
+					outputPrintf(L"%s", L"Deleted MyPresets.wpaPresets from %localappdata%\\Windows Performance Analyzer\n");
+			}
 		}
 	}
-
 }
 } // namespace {
 
@@ -130,8 +148,9 @@ void outputLastError(const DWORD lastErr)
 	outputPrintf(errBuff);
 }
 
-void debugLastError(const DWORD lastErr)
+void debugLastError(const DWORD lastErr) noexcept
 {
+#ifdef OUTPUT_DEBUG_STRINGS
 	const DWORD errMsgSize = 1024u;
 	wchar_t errBuff[errMsgSize] = {};
 	const DWORD ret = ::FormatMessageW(
@@ -142,6 +161,9 @@ void debugLastError(const DWORD lastErr)
 	if (ret == 0)
 		return; // FormatMessageW failed.
 	debugPrintf(L"UIforETW encountered an error: %s\r\n", errBuff);
+#else
+	(void)lastErr;
+#endif
 }
 
 std::vector<std::wstring> split(const std::wstring& s, const char c)
@@ -179,14 +201,16 @@ std::vector<std::wstring> GetFileList(const std::wstring& pattern, const bool fu
 				&findData, FindExSearchNameMatch, NULL, 0);
 	// Call GetLastError() here because on VC++ 2015 debug builds the memory
 	// allocations in the result constructor zero the last error value.
-	DWORD lastError = ::GetLastError();
+	const DWORD lastError = ::GetLastError();
 
 	std::vector<std::wstring> result;
 	if (hFindFile == INVALID_HANDLE_VALUE)
 	{
 		// If there are NO matching files, then FindFirstFileExW returns
 		// INVALID_HANDLE_VALUE and the last error is ERROR_FILE_NOT_FOUND.
-		UIETWASSERT(lastError == ERROR_FILE_NOT_FOUND);
+		// Or, apparently, ERROR_PATH_NOT_FOUND, if the directory itself
+		// doesn't exist (pathological case that I actually hit).
+		UIETWASSERT(lastError == ERROR_FILE_NOT_FOUND || lastError == ERROR_PATH_NOT_FOUND);
 		return result;
 	}
 	do
@@ -266,7 +290,7 @@ std::wstring ConvertToCRLF(const std::wstring& input)
 	std::wstring result;
 	result.reserve(input.size());
 
-	for (wchar_t c : input)
+	for (const wchar_t c : input)
 	{
 		// Replace '\n' with '\r\n' and ignore any '\r' characters that were
 		// previously present.
@@ -280,7 +304,55 @@ std::wstring ConvertToCRLF(const std::wstring& input)
 	return result;
 }
 
-void SetRegistryDWORD(const HKEY root, const std::wstring& subkey, const std::wstring& valueName, const DWORD value)
+std::wstring ReadRegistryString(HKEY root, const std::wstring& subkey, const std::wstring& valueName, bool force32Bit)
+{
+	std::wstring value;
+	const DWORD flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_ZEROONFAILURE;
+
+	REGSAM openOptions = KEY_QUERY_VALUE;
+	if (force32Bit)
+	{
+		openOptions |= KEY_WOW64_32KEY;
+	}
+
+	HKEY key;
+	if (::RegOpenKeyExW(root, subkey.c_str(), 0, openOptions, &key) != ERROR_SUCCESS)
+	{
+		return value;
+	}
+
+
+	DWORD bufSize = 50 * sizeof(wchar_t);
+	LSTATUS result = ERROR_MORE_DATA;
+	while (result == ERROR_MORE_DATA)
+	{
+		value.resize(bufSize / sizeof(wchar_t));
+		DWORD type;
+		result = ::RegGetValueW(key, nullptr, valueName.c_str(), flags, &type, const_cast<wchar_t*>(value.data()), &bufSize);
+	}
+	if (result == ERROR_SUCCESS && bufSize > 0)
+	{
+		// remove the space for the NUL teminator written by RegGetValueW
+		value.resize((bufSize / sizeof(wchar_t)) - 1);
+	}
+	else
+	{
+		value.clear();
+	}
+	ATLVERIFY(::RegCloseKey(key) == ERROR_SUCCESS);
+
+	return value;
+}
+
+bool GetRegistryDWORD(const HKEY root, const std::wstring& subkey, const std::wstring& valueName, DWORD* pValue) noexcept
+{
+	DWORD type = 0;
+	DWORD byteCount = sizeof(*pValue);
+	auto result = ::RegGetValueW(root, subkey.c_str(), valueName.c_str(), RRF_RT_REG_DWORD | RRF_ZEROONFAILURE, &type, pValue, &byteCount);
+	return result == ERROR_SUCCESS;
+}
+
+void SetRegistryDWORD(const HKEY root, const std::wstring& subkey, const std::wstring& valueName, const DWORD value) noexcept
 {
 	HKEY key;
 	if (::RegOpenKeyExW(root, subkey.c_str(), 0, KEY_ALL_ACCESS, &key) != ERROR_SUCCESS)
@@ -289,7 +361,7 @@ void SetRegistryDWORD(const HKEY root, const std::wstring& subkey, const std::ws
 	ATLVERIFY(::RegCloseKey(key) == ERROR_SUCCESS);
 }
 
-void CreateRegistryKey(const HKEY root, const std::wstring& subkey, const std::wstring& newKey)
+void CreateRegistryKey(const HKEY root, const std::wstring& subkey, const std::wstring& newKey) noexcept
 {
 	HKEY key;
 	if (::RegOpenKeyExW(root, subkey.c_str(), 0, KEY_ALL_ACCESS, &key) != ERROR_SUCCESS)
@@ -343,7 +415,7 @@ std::wstring GetEditControlText(const HWND hEdit)
 // the output buffer can easily be overrun
 // if this function is not first called with cchWideChar set to 0
 // in order to obtain the required size.
-int RequiredNumberOfWideChars(const std::string& text)
+int RequiredNumberOfWideChars(const std::string& text) noexcept
 {
 	static_assert(sizeof(std::string::value_type) == 1 == sizeof(text[0]),
 		"bad assumptions!");
@@ -408,7 +480,7 @@ std::wstring stringPrintf(_Printf_format_string_ PCWSTR const pFormat, ...)
 }
 
 // Call OutputDebugString with a format string and some printf-style arguments.
-void debugPrintf(_Printf_format_string_ PCWSTR const pFormat, ...)
+void debugPrintf(_Printf_format_string_ PCWSTR const pFormat, ...) noexcept
 {
 	va_list args;
 	va_start(args, pFormat);
@@ -422,7 +494,7 @@ void debugPrintf(_Printf_format_string_ PCWSTR const pFormat, ...)
 // Get the next/previous dialog item (next/prev in window order and tab order) allowing
 // for disabled controls, invisible controls, and wrapping at the end of the tab order.
 
-static bool ControlOK(const HWND win)
+static bool ControlOK(const HWND win) noexcept
 {
 	if (!win)
 		return false;
@@ -440,7 +512,7 @@ static bool ControlOK(const HWND win)
 	return true;
 }
 
-static HWND GetNextDlgItem(const HWND win, const bool Wrap)
+static HWND GetNextDlgItem(const HWND win, const bool Wrap) noexcept
 {
 	HWND next = ::GetWindow(win, GW_HWNDNEXT);
 	while ((next != win) && (!::ControlOK(next)))
@@ -460,7 +532,7 @@ static HWND GetNextDlgItem(const HWND win, const bool Wrap)
 }
 
 _Pre_satisfies_(Win != NULL)
-void SmartEnableWindow(const HWND Win, const BOOL Enable)
+void SmartEnableWindow(const HWND Win, const BOOL Enable) noexcept
 {
 	UIETWASSERT(Win);
 	if (!Enable)
@@ -543,9 +615,17 @@ std::wstring CanonicalizePath(const std::wstring& path)
 	return output;
 }
 
+void EnsureEndsWithDirSeparator(std::wstring& path)
+{
+	if (path.back() != '\\')
+	{
+		path.push_back(L'\\');
+	}
+}
 int DeleteOneFile(const HWND hwnd, const std::wstring& path)
 {
 	// {path} uses std::vector list initialization
+	// Returns zero for success
 	return DeleteFiles(hwnd, {path});
 }
 
@@ -558,11 +638,11 @@ int DeleteFiles(const HWND hwnd, const std::vector<std::wstring>& paths)
 	{
 		// Push the file name and its NULL terminator onto the vector.
 		fileNames.insert(fileNames.end(), path.c_str(), path.c_str() + path.size());
-		fileNames.emplace_back(0);
+		fileNames.push_back(0);
 	}
 
 	// Double null-terminate.
-	fileNames.emplace_back(0);
+	fileNames.push_back(0);
 
 	SHFILEOPSTRUCT fileOp =
 	{
@@ -574,6 +654,7 @@ int DeleteFiles(const HWND hwnd, const std::vector<std::wstring>& paths)
 	};
 	// Delete using the recycle bin.
 	// TODO: IFileOperation?
+	// Returns zero for success
 	return ::SHFileOperationW(&fileOp);
 }
 
@@ -623,7 +704,7 @@ std::wstring GetClipboardText()
 	return result;
 }
 
-int64_t GetFileSize(const std::wstring& path)
+int64_t GetFileSize(const std::wstring& path) noexcept
 {
 	LARGE_INTEGER result = {};
 	HANDLE hFile = ::CreateFileW(path.c_str(), GENERIC_READ,
@@ -632,7 +713,9 @@ int64_t GetFileSize(const std::wstring& path)
 
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
+#ifdef OUTPUT_DEBUG_STRINGS
 		debugPrintf(L"Failed to get file size!\n");
+#endif
 		debugLastError();
 		return 0;
 	}
@@ -651,7 +734,7 @@ int64_t GetFileSize(const std::wstring& path)
 
 uint64_t GetFileVersion(const std::wstring& path)
 {
-	DWORD  infoSize = GetFileVersionInfoSizeW(path.c_str(), nullptr);
+	const DWORD  infoSize = GetFileVersionInfoSizeW(path.c_str(), nullptr);
 	uint64_t result = 0;
 
 	if (infoSize)
@@ -666,7 +749,7 @@ uint64_t GetFileVersion(const std::wstring& path)
 			{
 				if (size)
 				{
-					auto* verInfo = static_cast<VS_FIXEDFILEINFO *>(pData);
+					const auto* const verInfo = static_cast<VS_FIXEDFILEINFO *>(pData);
 					if (verInfo->dwSignature == 0xFEEF04BD)
 					{
 						result = (static_cast<uint64_t>(verInfo->dwFileVersionMS) << 32) + verInfo->dwFileVersionLS;
@@ -679,7 +762,7 @@ uint64_t GetFileVersion(const std::wstring& path)
 	return result;
 }
 
-bool Is64BitWindows()
+bool Is64BitWindows() noexcept
 {
 #if defined(_WIN64)
 	return true;
@@ -690,7 +773,7 @@ bool Is64BitWindows()
 #endif
 }
 
-bool Is64BitBuild()
+bool Is64BitBuild() noexcept
 {
 #if defined(_WIN64)
 	return true;
@@ -785,7 +868,7 @@ std::wstring GetBuildTimeFromAddress(_In_ const void* const codeAddress)
 	const void* const ModuleHandle = memoryInfo.AllocationBase;
 
 	// Walk the PE data structures to find the link time stamp.
-	const IMAGE_DOS_HEADER* const DosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ModuleHandle);
+	const IMAGE_DOS_HEADER* const DosHeader = static_cast<const IMAGE_DOS_HEADER*>(ModuleHandle);
 	if (IMAGE_DOS_SIGNATURE != DosHeader->e_magic)
 	{
 		UIETWASSERT(0);
@@ -843,7 +926,10 @@ typedef struct tagTHREADNAME_INFO
 // warning C6320 : Exception - filter expression is the constant EXCEPTION_EXECUTE_HANDLER.This might mask exceptions that were not intended to be handled.
 // warning C6322 : Empty _except block.
 
-void SetCurrentThreadName(PCSTR const threadName)
+typedef HRESULT(WINAPI* SetThreadDescription_t)(HANDLE hThread,
+	PCWSTR lpThreadDescription);
+
+void SetCurrentThreadName(PCSTR const threadName) noexcept
 {
 	const DWORD dwThreadID = ::GetCurrentThreadId();
 	const THREADNAME_INFO info = { 0x1000, threadName, dwThreadID, 0 };
@@ -855,6 +941,20 @@ void SetCurrentThreadName(PCSTR const threadName)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
 	{
+	}
+
+	// SetThreadDescription shows up in Windows 10 Creators Edition (April 2017),
+	// probably in response to this blog post:
+	// https://randomascii.wordpress.com/2015/10/26/thread-naming-in-windows-time-for-something-better/
+	auto SetThreadDescription_p =
+		reinterpret_cast<SetThreadDescription_t>(::GetProcAddress(
+			::GetModuleHandle(L"Kernel32.dll"), "SetThreadDescription"));
+	if (SetThreadDescription_p)
+	{
+		wchar_t wThreadName[200];
+		size_t numConverted = 0;
+		mbstowcs_s(&numConverted, wThreadName, threadName, _TRUNCATE);
+		SetThreadDescription_p(GetCurrentThread(), wThreadName);
 	}
 }
 #pragma warning(pop)
@@ -872,12 +972,14 @@ void CopyStartupProfiles(const std::wstring& exeDir, const bool force)
 	copyWPAProfileToLocalAppData(exeDir, force);
 }
 
-void CloseValidHandle(_In_ _Pre_valid_ _Post_ptr_invalid_ const HANDLE handle)
+void CloseValidHandle(_In_ _Pre_valid_ _Post_ptr_invalid_ const HANDLE handle) noexcept
 {
 	ATLVERIFY(::CloseHandle(handle) != 0);
 }
 
-void MoveControl(CWnd* pParent, CWnd& control, int xDelta, int yDelta)
+#ifdef IS_MFC_APP
+// Put MFC specific code here
+void MoveControl(const CWnd* pParent, CWnd& control, int xDelta, int yDelta)
 {
 	const UINT flags = SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_NOACTIVATE;
 	CRect controlRect;
@@ -885,4 +987,60 @@ void MoveControl(CWnd* pParent, CWnd& control, int xDelta, int yDelta)
 	POINT p = { controlRect.left, controlRect.top };
 	pParent->ScreenToClient(&p);
 	control.SetWindowPos(nullptr, p.x + xDelta, p.y + yDelta, 0, 0, flags);
+}
+#endif
+
+// Parse the semi-colon separated heap trace settings
+HeapTracedProcesses ParseHeapTracingSettings(std::wstring heapTracingExes)
+{
+	HeapTracedProcesses result;
+	for (const auto& tracingName : split(heapTracingExes, ';'))
+	{
+		if (tracingName.size())
+		{
+			auto* p = tracingName.c_str();
+			// If the first character is a digit then assume that it's a PID.
+			if (iswdigit(p[0]))
+			{
+				if (wcschr(p, L' '))
+				{
+					outputPrintf(L"Error: don't use space separators between PIDs for heap tracing - use semicolons.\n");
+					continue;
+				}
+				// Convert to space separated PIDs because that is what the xperf -Pids
+				// option expects.
+				if (result.processIDs.size() > 0)
+					result.processIDs += L' ';
+				result.processIDs += tracingName;
+			}
+			else if (wcschr(p, '\\'))
+			{
+				// It must be a full path name.
+				result.pathName = tracingName;
+			}
+			else
+			{
+				if (wcschr(p, L' '))
+				{
+					outputPrintf(L"Error: don't use space separators between process names for heap tracing - use semicolons.\n");
+					continue;
+				}
+				result.processNames.push_back(tracingName);
+			}
+		}
+	}
+
+	// Since the three types of heap profiling are mutually exclusive, clear the
+	// ones that will not be used, to ensure consistency.
+	if (result.pathName.size())
+	{
+		result.processIDs = L"";
+		result.processNames.clear();
+	}
+	else if (result.processIDs.size())
+	{
+		result.processNames.clear();
+	}
+
+	return result;
 }

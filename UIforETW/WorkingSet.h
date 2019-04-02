@@ -18,17 +18,18 @@ limitations under the License.
 
 #include <vector>
 #include <string>
+#include "Utility.h"
 
 class CWorkingSetMonitor
 {
 public:
-	CWorkingSetMonitor();
+	CWorkingSetMonitor() noexcept;
 	~CWorkingSetMonitor();
 
 	// Start and stop the sampling threads so that they aren't running
 	// when tracing is not running.
 	void StartThreads();
-	void StopThreads();
+	void StopThreads() noexcept;
 
 	// Pass in a semi-colon separated list of process names that
 	// the working set display should monitor. If this is the
@@ -44,7 +45,7 @@ private:
 	HANDLE hThread_ = nullptr;
 	HANDLE hExitEvent_ = nullptr;
 
-	CCriticalSection processesLock_;
+	CriticalSection processesLock_;
 	// This is a list of process names to monitor. If the list is
 	// empty then no processes are monitored. If this list has one
 	// entry that is '*' then all processes are monitored. Otherwise
@@ -60,4 +61,9 @@ private:
 	// Incrementing counter that will be the same for all samples recorded
 	// at the same time.
 	unsigned counter_ = 0;
+
+	CWorkingSetMonitor(const CWorkingSetMonitor&) = delete;
+	CWorkingSetMonitor(const CWorkingSetMonitor&&) = delete;
+	CWorkingSetMonitor& operator=(const CWorkingSetMonitor&) = delete;
+	CWorkingSetMonitor& operator=(const CWorkingSetMonitor&&) = delete;
 };

@@ -26,8 +26,8 @@ class CSettings : public CDialog
 	DECLARE_DYNAMIC(CSettings)
 
 public:
-	CSettings(CWnd* pParent, const std::wstring& exeDir, const std::wstring& wpt81Dir, const std::wstring& wpt10Dir);   // standard constructor
-	virtual ~CSettings();
+	CSettings(CWnd* pParent, const std::wstring& exeDir, const std::wstring& wpt81Dir, const std::wstring& wpt10Dir) noexcept;   // standard constructor
+	~CSettings();
 
 // Dialog Data
 	enum { IDD = IDD_SETTINGS };
@@ -39,8 +39,13 @@ public:
 	std::wstring extraKernelFlags_;
 	std::wstring extraKernelStacks_;
 	std::wstring extraUserProviders_;
+	std::wstring perfCounters_;
+	bool bUseOtherKernelLogger_ = false;
+	bool bBackgroundTracing_ = true;
 	bool bChromeDeveloper_ = false;
+	bool bIdentifyChromeProcessesCPU_ = false;
 	bool bAutoViewTraces_ = false;
+	bool bRecordPreTrace_ = false;
 	bool bHeapStacks_ = false;
 	bool bVirtualAllocStacks_ = false;
 	bool bVersionChecks_ = false;
@@ -53,13 +58,16 @@ protected:
 	CEdit btExtraKernelFlags_;
 	CEdit btExtraStackwalks_;
 	CEdit btExtraUserProviders_;
-	CComboBox btBufferSizes_;
+	CEdit btPerfCounters_;
 
 	CButton btCopyStartupProfile_;
-	CButton btCopySymbolDLLs_;
 
+	CButton btUseOtherKernelLogger_;
 	CButton btChromeDeveloper_;
+	CButton btIdentifyChromeProcessesCPU_;
+	CButton btBackgroundMonitoring_;
 	CButton btAutoViewTraces_;
+	CButton btRecordPreTrace_;
 	CButton btHeapStacks_;
 	CButton btVirtualAllocStacks_;
 	CButton btVersionChecks_;
@@ -76,15 +84,24 @@ protected:
 	const std::wstring wpt10Dir_;
 
 	DECLARE_MESSAGE_MAP()
-	afx_msg void OnOK();
+	afx_msg void OnOK() override;
 public:
 	afx_msg void OnBnClickedCopystartupprofile();
-	afx_msg void OnBnClickedCopysymboldlls();
 	afx_msg BOOL PreTranslateMessage(MSG* pMsg);
 	afx_msg void OnBnClickedChromedeveloper();
-	afx_msg void OnBnClickedAutoviewtraces();
-	afx_msg void OnBnClickedHeapstacks();
-	afx_msg void OnBnClickedVirtualallocstacks();
-	afx_msg void OnBnClickedExpensivews();
-	afx_msg void OnBnClickedCheckfornewversions();
+	afx_msg void OnBnClickedAutoviewtraces() noexcept;
+	afx_msg void OnBnClickedHeapstacks() noexcept;
+	afx_msg void OnBnClickedVirtualallocstacks() noexcept;
+	afx_msg void OnBnClickedExpensivews() noexcept;
+	afx_msg void OnBnClickedCheckfornewversions() noexcept;
+	afx_msg void OnBnClickedSelectPerfCounters();
+	afx_msg void OnBnClickedUseOtherKernelLogger() noexcept;
+	afx_msg void OnBnClickedRecordPreTrace() noexcept;
+	afx_msg void OnBnClickedIdentifyChromeCpu() noexcept;
+	afx_msg void OnBnClickedBackgroundMonitoring() noexcept;
+
+	CSettings& operator=(const CSettings&) = delete;
+	CSettings& operator=(const CSettings&&) = delete;
+	CSettings(const CSettings&) = delete;
+	CSettings(const CSettings&&) = delete;
 };

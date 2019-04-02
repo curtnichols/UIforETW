@@ -20,10 +20,10 @@ limitations under the License.
 
 #include <vector>
 
-static const wchar_t* kPipeName = L"\\\\.\\PIPE\\UIforETWPipe";
+static const _TCHAR* const kPipeName = _T("\\\\.\\PIPE\\UIforETWPipe");
 
-ChildProcess::ChildProcess(std::wstring exePath)
-	: exePath_(std::move(exePath))
+ChildProcess::ChildProcess(string_type exePath, bool printFailedExitCodes) noexcept
+	: exePath_(std::move(exePath)), printFailedExitCodes_(printFailedExitCodes)
 {
 	// Create the pipe here so that it is guaranteed to be created before
 	// we try starting the process.
@@ -44,9 +44,10 @@ ChildProcess::~ChildProcess()
 {
 	if (hProcess_)
 	{
-		DWORD exitCode = GetExitCode();
-		if (exitCode)
-			outputPrintf(L"Process exit code was %08x (%lu)\n", exitCode, exitCode);
+		// Always get the exit code since this also waits for the process to exit.
+		const DWORD exitCode = GetExitCode();
+		if (printFailedExitCodes_ && exitCode)
+			outputPrintf(_T("Process exit code was %08x (%lu)\n"), exitCode, exitCode);
 		CloseHandle(hProcess_);
 	}
 	if (hOutputAvailable_)
@@ -55,28 +56,29 @@ ChildProcess::~ChildProcess()
 	}
 }
 
-bool ChildProcess::IsStillRunning()
+bool ChildProcess::IsStillRunning() noexcept
 {
 	HANDLE handles[] =
 	{
 		hProcess_,
 		hOutputAvailable_,
 	};
-	DWORD waitIndex = WaitForMultipleObjects(ARRAYSIZE(handles), &handles[0], FALSE, INFINITE);
+	const DWORD waitIndex = WaitForMultipleObjects(ARRAYSIZE(handles), &handles[0], FALSE, INFINITE);
 	// Return true if hProcess_ was not signaled.
 	return waitIndex != 0;
 }
 
-std::wstring ChildProcess::RemoveOutputText()
+ChildProcess::string_type ChildProcess::RemoveOutputText()
 {
 	CSingleLock locker(&outputLock_);
-	std::wstring result = processOutput_;
-	processOutput_ = L"";
+	string_type result = processOutput_;
+	processOutput_ = _T("");
 	return result;
 }
 
 DWORD WINAPI ChildProcess::ListenerThreadStatic(LPVOID pVoidThis)
 {
+	SetCurrentThreadName("Child-process listener");
 	ChildProcess* pThis = static_cast<ChildProcess*>(pVoidThis);
 	return pThis->ListenerThread();
 }
@@ -95,15 +97,23 @@ DWORD ChildProcess::ListenerThread()
 			{
 				CSingleLock locker(&outputLock_);
 				buffer[dwRead] = 0;
+#ifdef OUTPUT_DEBUG_STRINGS
 				OutputDebugStringA(buffer);
+#endif
+#ifdef _UNICODE
 				processOutput_ += AnsiToUnicode(buffer);
+#else
+				processOutput_ += buffer;
+#endif
 			}
 			SetEvent(hOutputAvailable_);
 		}
 	}
 	else
 	{
-		OutputDebugString(L"Connect failed.\n");
+#ifdef OUTPUT_DEBUG_STRINGS
+			OutputDebugString(_T("Connect failed.\n"));
+#endif
 	}
 
 	DisconnectNamedPipe(hPipe_);
@@ -112,12 +122,12 @@ DWORD ChildProcess::ListenerThread()
 }
 
 _Pre_satisfies_(!(this->hProcess_))
-bool ChildProcess::Run(bool showCommand, std::wstring args)
+bool ChildProcess::Run(bool showCommand, string_type args)
 {
-	UIETWASSERT(!hProcess_);
+	ASSERT(!hProcess_);
 
 	if (showCommand)
-		outputPrintf(L"%s\n", args.c_str());
+		outputPrintf(_T("%s\n"), args.c_str());
 
 	SECURITY_ATTRIBUTES security = { sizeof(security), 0, TRUE };
 
@@ -141,11 +151,11 @@ bool ChildProcess::Run(bool showCommand, std::wstring args)
 	startupInfo.dwFlags = STARTF_USESTDHANDLES;
 
 	PROCESS_INFORMATION processInfo = {};
-	DWORD flags = CREATE_NO_WINDOW;
+	const DWORD flags = CREATE_NO_WINDOW;
 	// Wacky CreateProcess rules say args has to be writable!
-	std::vector<wchar_t> argsCopy(args.size() + 1);
-	wcscpy_s(&argsCopy[0], argsCopy.size(), args.c_str());
-	BOOL success = CreateProcess(exePath_.c_str(), &argsCopy[0], NULL, NULL,
+	std::vector<_TCHAR> argsCopy(args.size() + 1);
+	_tcscpy_s(&argsCopy[0], argsCopy.size(), args.c_str());
+	const BOOL success = CreateProcess(exePath_.c_str(), &argsCopy[0], NULL, NULL,
 		TRUE, flags, NULL, NULL, &startupInfo, &processInfo);
 	if (success)
 	{
@@ -155,7 +165,7 @@ bool ChildProcess::Run(bool showCommand, std::wstring args)
 	}
 	else
 	{
-		outputPrintf(L"Error %d starting %s, %s\n", (int)GetLastError(), exePath_.c_str(), args.c_str());
+		outputPrintf(_T("Error %lu starting %s, %s\n"), GetLastError(), exePath_.c_str(), args.c_str());
 	}
 
 	return false;
@@ -172,10 +182,10 @@ DWORD ChildProcess::GetExitCode()
 	return result;
 }
 
-std::wstring ChildProcess::GetOutput()
+ChildProcess::string_type ChildProcess::GetOutput()
 {
 	if (!hProcess_)
-		return L"";
+		return _T("");
 	WaitForCompletion(false);
 	return RemoveOutputText();
 }
@@ -191,8 +201,8 @@ void ChildProcess::WaitForCompletion(bool printOutput)
 		{
 			if (printOutput)
 			{
-				std::wstring output = RemoveOutputText();
-				outputPrintf(L"%s", output.c_str());
+				string_type output = RemoveOutputText();
+				outputPrintf(_T("%s"), output.c_str());
 			}
 		}
 		// This isn't technically needed, but removing it would make
@@ -238,8 +248,8 @@ void ChildProcess::WaitForCompletion(bool printOutput)
 	{
 		// Now that the child thread has exited we can finally read
 		// the last of the child-process output.
-		std::wstring output = RemoveOutputText();
+		string_type output = RemoveOutputText();
 		if (!output.empty())
-			outputPrintf(L"%s", output.c_str());
+			outputPrintf(_T("%s"), output.c_str());
 	}
 }

@@ -19,6 +19,11 @@ limitations under the License.
 #include "Settings.h"
 #include "Utility.h"
 
+#include <pdh.h>
+#include <pdhmsg.h>
+
+#pragma comment(lib, "pdh.lib")
+
 /*
 When doing Chrome profilng it is possible to ask various Chrome tracing
 categories to emit ETW events. The filtered_event_group_names array
@@ -44,13 +49,14 @@ const PCWSTR filtered_event_group_names[] =
 	L"gpu",                                             // 0x20
 	L"input",                                           // 0x40
 	L"netlog",                                          // 0x80
-	L"renderer.scheduler",                              // 0x100
+	L"sequence_manager",                                // 0x100
 	L"toplevel",                                        // 0x200
 	L"v8",                                              // 0x400
 	L"disabled-by-default-cc.debug",                    // 0x800
 	L"disabled-by-default-cc.debug.picture",            // 0x1000
 	L"disabled-by-default-toplevel.flow",               // 0x2000
 	L"startup",                                         // 0x4000
+	L"latency",                                         // 0x8000
 };
 
 // 1ULL << 61 and 1ULL << 62 are special values that indicate to Chrome to
@@ -65,7 +71,7 @@ uint64_t disabled_other_events_keyword_bit = 1ULL << 62;
 
 IMPLEMENT_DYNAMIC(CSettings, CDialog)
 
-CSettings::CSettings(CWnd* pParent /*=NULL*/, const std::wstring& exeDir, const std::wstring& wpt81Dir, const std::wstring& wpt10Dir)
+CSettings::CSettings(CWnd* pParent /*=NULL*/, const std::wstring& exeDir, const std::wstring& wpt81Dir, const std::wstring& wpt10Dir) noexcept
 	: CDialog(CSettings::IDD, pParent)
 	, exeDir_(exeDir)
 	, wpt81Dir_(wpt81Dir)
@@ -80,21 +86,25 @@ CSettings::~CSettings()
 
 void CSettings::DoDataExchange(CDataExchange* pDX)
 {
+	// This is needed to get tooltips working.
 	DDX_Control(pDX, IDC_HEAPEXE, btHeapTracingExe_);
 	DDX_Control(pDX, IDC_WSMONITOREDPROCESSES, btWSMonitoredProcesses_);
 	DDX_Control(pDX, IDC_EXPENSIVEWS, btExpensiveWSMonitoring_);
 	DDX_Control(pDX, IDC_EXTRAKERNELFLAGS, btExtraKernelFlags_);
-	DDX_Control(pDX, IDC_EXTRASTACKWALKS, btExtraStackwalks_);
+	DDX_Control(pDX, IDC_EXTRASTACKWALKS, btExtraStackwalks_);;
 	DDX_Control(pDX, IDC_EXTRAUSERMODEPROVIDERS, btExtraUserProviders_);
-	DDX_Control(pDX, IDC_BUFFERSIZES, btBufferSizes_);
+	DDX_Control(pDX, IDC_PERFORMANCECOUNTERS, btPerfCounters_);
 	DDX_Control(pDX, IDC_COPYSTARTUPPROFILE, btCopyStartupProfile_);
-	DDX_Control(pDX, IDC_COPYSYMBOLDLLS, btCopySymbolDLLs_);
+	DDX_Control(pDX, IDC_USE_OTHER_KERNEL_LOGGER, btUseOtherKernelLogger_);
 	DDX_Control(pDX, IDC_CHROMEDEVELOPER, btChromeDeveloper_);
 	DDX_Control(pDX, IDC_AUTOVIEWTRACES, btAutoViewTraces_);
+	DDX_Control(pDX, IDC_RECORD_PRE_TRACE, btRecordPreTrace_);
 	DDX_Control(pDX, IDC_HEAPSTACKS, btHeapStacks_);
 	DDX_Control(pDX, IDC_VIRTUALALLOCSTACKS, btVirtualAllocStacks_);
 	DDX_Control(pDX, IDC_CHECKFORNEWVERSIONS, btVersionChecks_);
 	DDX_Control(pDX, IDC_CHROME_CATEGORIES, btChromeCategories_);
+	DDX_Control(pDX, IDC_IDENTIFY_CHROME_CPU, btIdentifyChromeProcessesCPU_);
+	DDX_Control(pDX, IDC_BACKGROUND_MONITORING, btBackgroundMonitoring_);
 
 	CDialog::DoDataExchange(pDX);
 }
@@ -102,13 +112,17 @@ void CSettings::DoDataExchange(CDataExchange* pDX)
 
 BEGIN_MESSAGE_MAP(CSettings, CDialog)
 	ON_BN_CLICKED(IDC_COPYSTARTUPPROFILE, &CSettings::OnBnClickedCopystartupprofile)
-	ON_BN_CLICKED(IDC_COPYSYMBOLDLLS, &CSettings::OnBnClickedCopysymboldlls)
 	ON_BN_CLICKED(IDC_CHROMEDEVELOPER, &CSettings::OnBnClickedChromedeveloper)
 	ON_BN_CLICKED(IDC_AUTOVIEWTRACES, &CSettings::OnBnClickedAutoviewtraces)
 	ON_BN_CLICKED(IDC_HEAPSTACKS, &CSettings::OnBnClickedHeapstacks)
 	ON_BN_CLICKED(IDC_VIRTUALALLOCSTACKS, &CSettings::OnBnClickedVirtualallocstacks)
 	ON_BN_CLICKED(IDC_EXPENSIVEWS, &CSettings::OnBnClickedExpensivews)
 	ON_BN_CLICKED(IDC_CHECKFORNEWVERSIONS, &CSettings::OnBnClickedCheckfornewversions)
+	ON_BN_CLICKED(IDC_SELECT_PERF_COUNTERS, &CSettings::OnBnClickedSelectPerfCounters)
+	ON_BN_CLICKED(IDC_USE_OTHER_KERNEL_LOGGER, &CSettings::OnBnClickedUseOtherKernelLogger)
+	ON_BN_CLICKED(IDC_RECORD_PRE_TRACE, &CSettings::OnBnClickedRecordPreTrace)
+	ON_BN_CLICKED(IDC_IDENTIFY_CHROME_CPU, &CSettings::OnBnClickedIdentifyChromeCpu)
+	ON_BN_CLICKED(IDC_BACKGROUND_MONITORING, &CSettings::OnBnClickedBackgroundMonitoring)
 END_MESSAGE_MAP()
 
 BOOL CSettings::OnInitDialog()
@@ -116,13 +130,17 @@ BOOL CSettings::OnInitDialog()
 	CDialog::OnInitDialog();
 
 	SetDlgItemText(IDC_HEAPEXE, heapTracingExes_.c_str());
+	CheckDlgButton(IDC_USE_OTHER_KERNEL_LOGGER, bUseOtherKernelLogger_);
+	CheckDlgButton(IDC_BACKGROUND_MONITORING, bBackgroundTracing_);
 	CheckDlgButton(IDC_CHROMEDEVELOPER, bChromeDeveloper_);
+	CheckDlgButton(IDC_IDENTIFY_CHROME_CPU, bIdentifyChromeProcessesCPU_);
 	CheckDlgButton(IDC_AUTOVIEWTRACES, bAutoViewTraces_);
+	CheckDlgButton(IDC_RECORD_PRE_TRACE, bRecordPreTrace_);
 	CheckDlgButton(IDC_HEAPSTACKS, bHeapStacks_);
 	CheckDlgButton(IDC_VIRTUALALLOCSTACKS, bVirtualAllocStacks_);
 	CheckDlgButton(IDC_CHECKFORNEWVERSIONS, bVersionChecks_);
 
-	btBufferSizes_.EnableWindow(FALSE);
+	btIdentifyChromeProcessesCPU_.EnableWindow(bChromeDeveloper_);
 	if (IsWindows8Point1OrGreater())
 	{
 		// The working set monitoring is not needed on Windows 8.1 and above because
@@ -144,16 +162,20 @@ BOOL CSettings::OnInitDialog()
 	btExtraKernelFlags_.SetWindowTextW(extraKernelFlags_.c_str());
 	btExtraStackwalks_.SetWindowTextW(extraKernelStacks_.c_str());
 	btExtraUserProviders_.SetWindowTextW(extraUserProviders_.c_str());
+	btPerfCounters_.SetWindowTextW(perfCounters_.c_str());
 
 	if (toolTip_.Create(this))
 	{
 		toolTip_.SetMaxTipWidth(400);
 		toolTip_.Activate(TRUE);
 
-		toolTip_.AddTool(&btHeapTracingExe_, L"Specify the file names of the exes to be heap traced, "
-					L"separated by semi-colons. "
-					L"Enter just the file parts (with the .exe extension) not a full path. For example, "
-					L"'chrome.exe;notepad.exe'. This is for use with the heap-tracing-to-file mode.");
+		toolTip_.AddTool(&btHeapTracingExe_, L"Specify which processes to heap trace when using "
+					L"heap-tracing-to-file mode. Three different methods can be used to specify the processes:\n"
+					L"1) A semi-colon separated list of process names, such as 'chrome.exe;notepad.exe'. "
+					L"The processes must be launched after this is set and heap-tracing-to-file is selected.\n"
+					L"2) A semi-colon separated list of process IDs (PIDs) - maximum of two - such as '1234;5678'.\n"
+					L"3) A fully specified path to an executable that will be launched by ETW when heap tracing is "
+					L"started.");
 		toolTip_.AddTool(&btExtraKernelFlags_, L"Extra kernel flags, separated by '+', such as "
 					L"\"REGISTRY+PERF_COUNTER\". See \"xperf -providers k\" for the full list. "
 					L"Note that incorrect kernel flags will cause tracing to fail to start.");
@@ -165,7 +187,9 @@ BOOL CSettings::OnInitDialog()
 		toolTip_.AddTool(&btExtraUserProviders_, L"Extra user providers, separated by '+', such as "
 					L"\n\"Microsoft-Windows-Audio+Microsoft-Windows-HttpLog\". See \"xperf -providers\" "
 					L"for the full list. "
+					L"TraceLogging and EventSource providers must be prefixed by '*'. "
 					L"Note that incorrect user providers will cause tracing to fail to start.");
+		toolTip_.AddTool(&btPerfCounters_, L"Arbitrary performance counters to be logged occasionally.");
 		toolTip_.AddTool(&btWSMonitoredProcesses_, L"Names of processes whose working sets will be "
 					L"monitored, separated by semi-colons. An empty string means no monitoring. A '*' means "
 					L"that all processes will be monitored. For instance 'chrome.exe;notepad.exe'");
@@ -176,15 +200,15 @@ BOOL CSettings::OnInitDialog()
 		toolTip_.AddTool(&btCopyStartupProfile_, L"Copies startup.wpaProfile files for WPA 8.1 and "
 					L"10 to the appropriate destinations so that the next time WPA starts up it will have "
 					L"reasonable analysis defaults.");
-		toolTip_.AddTool(&btCopySymbolDLLs_, L"Copy dbghelp.dll and symsrv.dll to the xperf directory to "
-					L"try to resolve slow or failed symbol loading in WPA. See "
-					L"https://randomascii.wordpress.com/2012/10/04/xperf-symbol-loading-pitfalls/ "
-					L"for details.");
+		toolTip_.AddTool(&btUseOtherKernelLogger_, L"Check this to have UIforETW use the alternate kernel "
+					L"logger. This is needed on some machines where the main kernel logger is in use.");
 		toolTip_.AddTool(&btChromeDeveloper_, L"Check this to enable Chrome specific behavior such as "
-					L"setting the Chrome symbol server path, and preprocessing of Chrome symbols and "
-					L"traces.");
+					L"setting the Chrome symbol server path, and identifying Chrome processes.");
 		toolTip_.AddTool(&btAutoViewTraces_, L"Check this to have UIforETW launch the trace viewer "
 					L"immediately after a trace is recorded.");
+		toolTip_.AddTool(&btRecordPreTrace_, L"Check this to enable recording of a startup trace "
+					L"to grab a snapshot of module version and symbol information. This allows analyzing "
+					L"traces across upgrades, such as chrome restart upgrades.");
 		toolTip_.AddTool(&btHeapStacks_, L"Check this to record call stacks on HeapAlloc, HeapRealloc, "
 					L"and similar calls, when doing heap traces.");
 		toolTip_.AddTool(&btVirtualAllocStacks_, L"Check this to record call stacks on VirtualAlloc on all "
@@ -194,6 +218,13 @@ BOOL CSettings::OnInitDialog()
 					L"to emit ETW events for. This requires running Chrome version 46 or later, and "
 					L"using chrome://flags/ to \"Enable exporting of tracing events to ETW\" - search for "
 					L"trace-export on the chrome://flags/ page.");
+		toolTip_.AddTool(&btIdentifyChromeProcessesCPU_, L"If this is checked and \"Chrome developer\" is "
+					L"checked then CPU usage details of Chrome processes will be added to the trace information "
+					L"file when traces are recorded. Calculating the CPU usage details can take a while.");
+		toolTip_.AddTool(&btBackgroundMonitoring_, L"When this is checked background threads will periodically "
+					L"(a few times per second) record information about system performance to the trace being "
+					L"recorded. This can be helpful in understanding performance problems but may affect "
+					L"power consumption.");
 	}
 
 	// Initialize the list of check boxes with all of the Chrome categories which
@@ -223,6 +254,7 @@ void CSettings::OnOK()
 	extraKernelStacks_ = GetEditControlText(btExtraStackwalks_);
 	extraKernelFlags_ = GetEditControlText(btExtraKernelFlags_);
 	extraUserProviders_ = GetEditControlText(btExtraUserProviders_);
+	perfCounters_ = GetEditControlText(btPerfCounters_);
 
 	// Extract the Chrome categories settings and put the result in chromeKeywords_.
 	chromeKeywords_ = 0;
@@ -256,79 +288,139 @@ void CSettings::OnBnClickedCopystartupprofile()
 }
 
 
-void CSettings::OnBnClickedCopysymboldlls()
-{
-	// Attempt to deal with these problems:
-	// https://randomascii.wordpress.com/2012/10/04/xperf-symbol-loading-pitfalls/
-	const wchar_t* fileNames[] =
-	{
-		L"dbghelp.dll",
-		L"symsrv.dll",
-	};
-
-	bool bIsWin64 = Is64BitWindows();
-
-	const std::wstring third_party = exeDir_ + L"..\\third_party\\";
-	std::vector<std::wstring> wptDirs;
-	if (!wpt81Dir_.empty())
-		wptDirs.push_back(wpt81Dir_);
-	wptDirs.push_back(wpt10Dir_);
-	// Perform the operation twice, potentially, for WPT 8.1 and WPT 10
-	for (auto& wptDir : wptDirs)
-	{
-		bool failed = false;
-		for (size_t i = 0; i < ARRAYSIZE(fileNames); ++i)
-		{
-			std::wstring source = third_party + fileNames[i];
-			if (bIsWin64)
-				source = third_party + L"x64\\" + fileNames[i];
-
-			std::wstring dest = wptDir + fileNames[i];
-			if (!CopyFile(source.c_str(), dest.c_str(), FALSE))
-				failed = true;
-		}
-		std::wstring message;
-		if (failed)
-			message = stringPrintf(L"Failed to copy dbghelp.dll and symsrv.dll to %s. Is WPA running?", wptDir.c_str());
-		else
-			message = stringPrintf(L"Copied dbghelp.dll and symsrv.dll to %s. If this doesn't help "
-				L"with symbol loading then consider deleting them to restore the previous state.", wptDir.c_str());
-		AfxMessageBox(message.c_str());
-	}
-}
-
-
 void CSettings::OnBnClickedChromedeveloper()
 {
 	bChromeDeveloper_ = !bChromeDeveloper_;
+	btIdentifyChromeProcessesCPU_.EnableWindow(bChromeDeveloper_);
 }
 
 
-void CSettings::OnBnClickedAutoviewtraces()
+void CSettings::OnBnClickedIdentifyChromeCpu() noexcept
+{
+	bIdentifyChromeProcessesCPU_ = !bIdentifyChromeProcessesCPU_;
+}
+
+
+void CSettings::OnBnClickedAutoviewtraces() noexcept
 {
 	bAutoViewTraces_ = !bAutoViewTraces_;
 }
 
 
-void CSettings::OnBnClickedHeapstacks()
+void CSettings::OnBnClickedHeapstacks() noexcept
 {
 	bHeapStacks_ = !bHeapStacks_;
 }
 
 
-void CSettings::OnBnClickedVirtualallocstacks()
+void CSettings::OnBnClickedVirtualallocstacks() noexcept
 {
 	bVirtualAllocStacks_ = !bVirtualAllocStacks_;
 }
 
 
-void CSettings::OnBnClickedExpensivews()
+void CSettings::OnBnClickedExpensivews() noexcept
 {
 	bExpensiveWSMonitoring_ = !bExpensiveWSMonitoring_;
 }
 
 
-void CSettings::OnBnClickedCheckfornewversions()
+void CSettings::OnBnClickedCheckfornewversions() noexcept
 {
 	bVersionChecks_ = !bVersionChecks_;
+}
+
+struct CallbackArg {
+	std::vector<std::wstring>* counters;
+	PDH_BROWSE_DLG_CONFIG* config;
+	std::vector<wchar_t> counter_names;
+};
+
+PDH_STATUS __stdcall CounterCallBack(
+	_In_ DWORD_PTR dwArg
+) {
+	CallbackArg* arg = reinterpret_cast<CallbackArg*>(dwArg);
+
+	/*
+	// The documentation suggests that this code will be used, but I have
+	// never been able to invoke it.
+	if (arg->config->CallBackStatus == PDH_MORE_DATA) {
+		arg->counter_names.resize(arg->counter_names.size() * 2); // Annoyingly, the callback does not tell us how much space is needed
+		arg->config->szReturnPathBuffer = arg->counter_names.data();
+		arg->config->cchReturnPathLength = (DWORD)arg->counter_names.size();
+		return PDH_RETRY;
+	}
+	*/
+
+	wchar_t* counters = arg->config->szReturnPathBuffer;
+	while (*counters != '\0') {
+		arg->counters->push_back(counters);
+		counters += arg->counters->back().length();
+		counters++; // Skip the null terminator to move to the first character of the next counter, or second null terminator
+	}
+	return ERROR_SUCCESS;
+}
+
+void CSettings::OnBnClickedSelectPerfCounters()
+{
+	std::vector<std::wstring> counters;
+	PDH_BROWSE_DLG_CONFIG config = {};
+	CallbackArg arg = {};
+	const size_t arbitrary_magic_buffer_size = 10000;
+	arg.counter_names.resize(arbitrary_magic_buffer_size);
+	arg.config = &config;
+	arg.counters = &counters;
+	config.bSingleCounterPerDialog = false;
+	config.bIncludeCostlyObjects = false;
+	config.bIncludeInstanceIndex = true;
+
+	// I get crashes deep inside pdhui.dll if I set this to false and select
+	// something (All Instances) that results in a wildcard. WTF?
+	config.bWildCardInstances = true;
+	config.bDisableMachineSelection = true;
+	// /analyze warns that this const_cast is not needed, but when compiling with
+	// /Zc:strictStrings it absolutely is. The type of szDialogBoxCaption needs to
+	// be changed for this to work cleanly.
+	config.szDialogBoxCaption = const_cast<wchar_t*>(L"Select performance counters");
+
+	config.hWndOwner = *this;
+
+	config.pCallBack = &CounterCallBack;
+	config.dwCallBackArg = reinterpret_cast<DWORD_PTR>(&arg);
+	config.dwDefaultDetailLevel = PERF_DETAIL_EXPERT;
+	config.szReturnPathBuffer = arg.counter_names.data();
+	config.cchReturnPathLength = static_cast<DWORD>(arg.counter_names.size());
+	// Need some way to initialize the dialog with the previous settings?
+	const PDH_STATUS status = PdhBrowseCounters(&config);
+	if (status == ERROR_SUCCESS || status == PDH_DIALOG_CANCELLED)
+	{
+		std::wstring counters_string;
+		for (auto& counter : counters)
+		{
+			counters_string += counter;
+			counters_string += ';'; // I hope that is a valid separator.
+		}
+		// Trim the trailing ';'
+		if (!counters_string.empty())
+			counters_string.resize(counters_string.size() - 1);
+		SetDlgItemTextW(IDC_PERFORMANCECOUNTERS, counters_string.c_str());
+	}
+}
+
+
+void CSettings::OnBnClickedUseOtherKernelLogger() noexcept
+{
+	bUseOtherKernelLogger_ = !bUseOtherKernelLogger_;
+}
+
+
+void CSettings::OnBnClickedRecordPreTrace() noexcept
+{
+	bRecordPreTrace_ = !bRecordPreTrace_;
+}
+
+
+void CSettings::OnBnClickedBackgroundMonitoring() noexcept
+{
+	bBackgroundTracing_ = !bBackgroundTracing_;
 }

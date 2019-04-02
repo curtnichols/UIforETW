@@ -25,13 +25,27 @@ namespace
 
 std::atomic<bool> g_LogKeyboardDetails(false);
 
+std::string MetaKeys()
+{
+	std::string metaKeys;
+	if (GetAsyncKeyState(VK_CONTROL))
+		metaKeys += "Ctrl+";
+	if (GetAsyncKeyState(VK_SHIFT))
+		metaKeys += "Shift+";
+	if (GetAsyncKeyState(VK_MENU))
+		metaKeys += "Alt+";
+	if (GetAsyncKeyState(VK_LWIN) || GetAsyncKeyState(VK_RWIN))
+		metaKeys += "Win+";
+	return metaKeys;
+}
+
 _Pre_satisfies_(nCode == HC_ACTION)
 LRESULT CALLBACK LowLevelKeyboardHook(int nCode, WPARAM wParam, LPARAM lParam)
 {
 	UIETWASSERT(nCode == HC_ACTION);
 	// wParam is WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, or WM_SYSKEYUP
 
-	KBDLLHOOKSTRUCT* pKbdLLHook = (KBDLLHOOKSTRUCT*)lParam;
+	const KBDLLHOOKSTRUCT* const pKbdLLHook = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
 	if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
 	{
@@ -42,6 +56,7 @@ LRESULT CALLBACK LowLevelKeyboardHook(int nCode, WPARAM wParam, LPARAM lParam)
 		char buffer[20];
 		const char* pLabel = buffer;
 		DWORD code = pKbdLLHook->vkCode;
+		bool isMetaKey = false;
 
 		if ((code >= 'A' && code <= 'Z') || (code >= '0' && code <= '9') || code == ' ')
 		{
@@ -112,16 +127,19 @@ LRESULT CALLBACK LowLevelKeyboardHook(int nCode, WPARAM wParam, LPARAM lParam)
 			case VK_LSHIFT:
 			case VK_RSHIFT:
 				pLabel = "shift";
+				isMetaKey = true;
 				break;
 			case VK_CONTROL:
 			case VK_LCONTROL:
 			case VK_RCONTROL:
 				pLabel = "control";
+				isMetaKey = true;
 				break;
 			case VK_MENU:
 			case VK_LMENU:
 			case VK_RMENU:
 				pLabel = "alt";
+				isMetaKey = true;
 				break;
 			case VK_ESCAPE:
 				pLabel = "esc";
@@ -129,31 +147,33 @@ LRESULT CALLBACK LowLevelKeyboardHook(int nCode, WPARAM wParam, LPARAM lParam)
 			case VK_LWIN:
 			case VK_RWIN:
 				pLabel = "Win";
+				isMetaKey = true;
 				break;
 			case VK_OEM_PERIOD:
 				pLabel = ".";
 				break;
 			default:
 				// Handle miscellaneous keys that are otherwise missed.
-				if (UINT translated = MapVirtualKey(code, MAPVK_VK_TO_CHAR))
+				if (const UINT translated = MapVirtualKey(code, MAPVK_VK_TO_CHAR))
 					sprintf_s(buffer, "%c", translated);
 				else
 					pLabel = "<unknown key>";
 				break;
 			}
 		}
-		ETWKeyDown(code, pLabel, 0, 0);
+		std::string keyDownDetails = isMetaKey ? pLabel : MetaKeys() + pLabel;
+		ETWKeyDown(code, keyDownDetails.c_str(), 0, 0);
 	}
 
 	return CallNextHookEx(0, nCode, wParam, lParam);
 }
 
 _Pre_satisfies_(nCode == HC_ACTION)
-LRESULT CALLBACK LowLevelMouseHook(int nCode, WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK LowLevelMouseHook(int nCode, WPARAM wParam, LPARAM lParam) noexcept
 {
 	UIETWASSERT(nCode == HC_ACTION);
 
-	MSLLHOOKSTRUCT* pMouseLLHook = (MSLLHOOKSTRUCT*)lParam;
+	const MSLLHOOKSTRUCT* const pMouseLLHook = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
 	int whichButton = -1;
 	bool pressed = true;
@@ -198,7 +218,7 @@ LRESULT CALLBACK LowLevelMouseHook(int nCode, WPARAM wParam, LPARAM lParam)
 	{
 		if (wParam == WM_MOUSEWHEEL)
 		{
-			int wheelDelta = GET_WHEEL_DELTA_WPARAM(pMouseLLHook->mouseData);
+			const int wheelDelta = GET_WHEEL_DELTA_WPARAM(pMouseLLHook->mouseData);
 			ETWMouseWheel(0, wheelDelta, pMouseLLHook->pt.x, pMouseLLHook->pt.y);
 		}
 
@@ -213,16 +233,18 @@ LRESULT CALLBACK LowLevelMouseHook(int nCode, WPARAM wParam, LPARAM lParam)
 
 
 
-DWORD __stdcall InputThread(LPVOID)
+DWORD __stdcall InputThread(LPVOID) noexcept
 {
-	SetCurrentThreadName("Input logging thread");
+	SetCurrentThreadName("Input logger");
 
 	// When UIforETW is halted in a debugger the keyboard and mouse hooks cannot respond
 	// in a timely manner. This means that each bit of user input has to timeout, which
 	// makes debugging painful - the timeout appears to be about ten seconds.
 	if (IsDebuggerPresent())
 	{
+#ifdef OUTPUT_DEBUG_STRINGS
 		OutputDebugString(L"Input logging disabled while debugging.\n");
+#endif
 		return 0;
 	}
 
@@ -267,7 +289,7 @@ DWORD __stdcall InputThread(LPVOID)
 
 }
 
-void SetKeyloggingState(enum KeyLoggerState state)
+void SetKeyloggingState(enum KeyLoggerState state) noexcept
 {
 	static HANDLE s_hThread = 0;
 	static DWORD s_threadID;

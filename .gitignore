@@ -1,6 +1,8 @@
+*.bak
 *.aps
 # wpaexporter drops these
 *.csv
+*.etl
 *.exe
 *.exp
 *.ilk
@@ -26,14 +28,16 @@ present.txt
 
 # VS 2015 drops these
 *.VC.opendb
-/.vs/
+.vs/
 
 # Temporary flamegraph files
 flamegraph.txt
 
 #Created by package_etw.bat
 etwpackage/
-etwpackage.zip
+etwpackage*.zip
+etwsymbols*.zip
+sourceindex.txt
 
 Debug/
 Release/

@@ -16,6 +16,8 @@ limitations under the License.
 
 #pragma once
 
+#include <string>
+
 // https://software.intel.com/en-us/blogs/2012/12/13/using-the-intel-power-gadget-api-on-mac-os-x
 typedef int(*IntelEnergyLibInitialize_t)();
 typedef int(*GetNumMsrs_t)(int* nMsr);
@@ -28,25 +30,35 @@ typedef int(*GetMaxTemperature_t)(int iNode, int* degreeC);
 class CPowerStatusMonitor
 {
 public:
-	CPowerStatusMonitor();
+	enum class MonitorType
+	{
+		LightLoad,
+		HeavyLoad
+	};
+	CPowerStatusMonitor() noexcept;
 	~CPowerStatusMonitor();
+
+	// Tell the system which perf counters (if any) to monitor. Only call
+	// this when the threads are stopped.
+	void SetPerfCounters(const std::wstring& perfCounters);
 
 	// Start and stop the sampling threads so that they aren't running
 	// when tracing is not running.
-	void StartThreads();
-	void StopThreads();
+	void StartThreads(MonitorType monitorType) noexcept;
+	void StopThreads() noexcept;
 
 private:
 	static DWORD __stdcall StaticPowerMonitorThread(LPVOID);
 	void PowerMonitorThread();
 
 	void SampleBatteryStat();
-	void SampleCPUPowerState();
-	void SampleTimerState();
-	void ClearEnergyLibFunctionPointers();
+	void SampleCPUPowerState() noexcept;
+	void SampleTimerState() noexcept;
+	void ClearEnergyLibFunctionPointers() noexcept;
 
 	HANDLE hThread_ = nullptr;
 	HANDLE hExitEvent_ = nullptr;
+	MonitorType monitorType_ = MonitorType::HeavyLoad;
 
 	HMODULE energyLib_ = nullptr;
 	IntelEnergyLibInitialize_t IntelEnergyLibInitialize = nullptr;
@@ -57,6 +69,10 @@ private:
 	ReadSample_t ReadSample = nullptr;
 	int maxTemperature_ = 0;
 
+	std::wstring perfCounters_;
+
 	CPowerStatusMonitor& operator=(const CPowerStatusMonitor&) = delete;
+	CPowerStatusMonitor& operator=(const CPowerStatusMonitor&&) = delete;
 	CPowerStatusMonitor(const CPowerStatusMonitor&) = delete;
+	CPowerStatusMonitor(const CPowerStatusMonitor&&) = delete;
 };

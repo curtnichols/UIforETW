@@ -1,7 +1,7 @@
 .aps
 
 .csv
-
+.etl
 .exp
 .ilk
 .opensdf
@@ -11,8 +11,12 @@
 .pdb
 .user
 symsrv.yes
+.vc.db
+Debug\
+Release\
 
 
+pmc_counters_test.txt
 FuncStats.txt
 GuidStats.txt
 Log.txt
@@ -22,3 +26,6 @@ present.txt
 .gitignore
 _dev
 flamegraph.pl
+
+.iobj
+.ipdb

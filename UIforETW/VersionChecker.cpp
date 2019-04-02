@@ -19,7 +19,7 @@ void CVersionChecker::VersionCheckerThread()
 		// of the buffer.
 		while (totalBytesRead < sizeof(buffer) - 1)
 		{
-			UINT bytesRead = webFile->Read(buffer + totalBytesRead, sizeof(buffer) - 1 - totalBytesRead);
+			const UINT bytesRead = webFile->Read(buffer + totalBytesRead, sizeof(buffer) - 1 - totalBytesRead);
 			if (!bytesRead)
 				break;
 			totalBytesRead += bytesRead;
@@ -38,7 +38,9 @@ void CVersionChecker::VersionCheckerThread()
 		version_string += strlen(marker);
 		if (strlen(version_string) > 4)
 		{
-			version_string[4] = 0;
+			// String is something like: "v1.32\?..." and we want to cut off after
+			// v1.32
+			version_string[5] = 0;
 			PackagedFloatVersion newVersion;
 			newVersion.u = 0;
 			if (sscanf_s(version_string, "v%f", &newVersion.f) == 1)
@@ -54,18 +56,18 @@ void CVersionChecker::VersionCheckerThread()
 
 DWORD __stdcall CVersionChecker::StaticVersionCheckerThread(LPVOID pParam)
 {
-	CVersionChecker* pThis = (CVersionChecker*)pParam;
+	CVersionChecker* pThis = static_cast<CVersionChecker*>(pParam);
 	pThis->VersionCheckerThread();
 	return 0;
 }
 
-void CVersionChecker::StartVersionCheckerThread(CWnd* pWindow)
+void CVersionChecker::StartVersionCheckerThread(CWnd* pWindow) noexcept
 {
 	pWindow_ = pWindow;
 	hThread_ = CreateThread(nullptr, 0, StaticVersionCheckerThread, this, 0, nullptr);
 }
 
-CVersionChecker::CVersionChecker()
+CVersionChecker::CVersionChecker() noexcept
 {
 }
 

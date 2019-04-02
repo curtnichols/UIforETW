@@ -24,6 +24,7 @@ limitations under the License.
 #include "Utility.h"
 #include "WorkingSet.h"
 #include "Version.h"
+#include "TraceLoggingSupport.h"
 
 #include <algorithm>
 #include <direct.h>
@@ -83,7 +84,49 @@ void CUIforETWDlg::vprintf(const wchar_t* pFormat, va_list args)
 }
 
 
-CUIforETWDlg::CUIforETWDlg(CWnd* pParent /*=NULL*/)
+static std::wstring TranslateTraceLoggingProvider(const std::wstring& provider)
+{
+	std::wstring providerOptions;
+	std::wstring justProviderName(provider);
+	const auto endOfProvider = justProviderName.find(L':');
+	if (endOfProvider != std::wstring::npos)
+	{
+		providerOptions = justProviderName.substr(endOfProvider);
+		justProviderName.resize(endOfProvider);
+	}
+
+	std::wstring providerGUID = TraceLoggingProviderNameToGUID(justProviderName);
+
+	providerGUID += providerOptions;
+	return providerGUID;
+}
+
+static std::wstring TranslateUserModeProviders(const std::wstring& providers)
+{
+	std::wstring translatedProviders;
+	translatedProviders.reserve(providers.size());
+	for (const auto& provider : split(providers, '+'))
+	{
+		if (provider.empty())
+		{
+			continue;
+		}
+		translatedProviders += '+';
+		if (provider.front() != '*')
+		{
+			translatedProviders += provider;
+			continue;
+		}
+		// if the provider name begins with a *, it follows the EventSource / TraceLogging
+		// convention and must be translated to a GUID.
+		// remove the leading '*' before calling the function
+		translatedProviders += TranslateTraceLoggingProvider(provider.substr(1));
+	}
+
+	return translatedProviders;
+}
+
+CUIforETWDlg::CUIforETWDlg(CWnd* pParent /*=NULL*/) noexcept
 	: CDialog(CUIforETWDlg::IDD, pParent)
 	, monitorThread_(this)
 {
@@ -162,7 +205,7 @@ void CUIforETWDlg::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_CONTEXTSWITCHCALLSTACKS, btCswitchStacks_);
 	DDX_Control(pDX, IDC_FASTSAMPLING, btFastSampling_);
 	DDX_Control(pDX, IDC_GPUTRACING, btGPUTracing_);
-	DDX_Control(pDX, IDC_CLRTRACING, btCLRTracing_ );
+	DDX_Control(pDX, IDC_CLRTRACING, btCLRTracing_);
 	DDX_Control(pDX, IDC_SHOWCOMMANDS, btShowCommands_);
 
 	DDX_Control(pDX, IDC_INPUTTRACING, btInputTracing_);
@@ -217,7 +260,7 @@ BEGIN_MESSAGE_MAP(CUIforETWDlg, CDialog)
 	ON_BN_CLICKED(ID_PASTEOVERRIDE, &CUIforETWDlg::NotesPaste)
 	ON_WM_ACTIVATE()
 	ON_WM_TIMER()
-	ON_BN_CLICKED( IDC_CLRTRACING, &CUIforETWDlg::OnBnClickedClrtracing )
+	ON_BN_CLICKED(IDC_CLRTRACING, &CUIforETWDlg::OnBnClickedClrtracing)
 END_MESSAGE_MAP()
 
 
@@ -241,6 +284,58 @@ void CUIforETWDlg::SetSymbolPath()
 		(void)_putenv(("_NT_SYMCACHE_PATH=" + systemDrive_ + "symcache").c_str());
 }
 
+void CUIforETWDlg::CheckSymbolDLLs()
+{
+	// Starting with the 10.0.14393.33 (Windows 10 Anniversary) edition of
+	// WPT the latest version of symsrv.dll *must* be used. So, old copies
+	// in the WPT directory have to be deleted. Failing to do this will cause
+	// heap corruption and other crashes because WPT expects a thread-safe
+	// symsrv.dll, and the old versions aren't. Also, dbghelp.dll is rarely
+	// needed so it is deleted at the same time.
+	// Previously the old copies were used to handle these issues:
+	// https://randomascii.wordpress.com/2012/10/04/xperf-symbol-loading-pitfalls/
+	const wchar_t* const fileNames[] =
+	{
+		L"dbghelp.dll",
+		L"symsrv.dll",
+	};
+
+	std::vector<std::wstring> filePaths;
+	for (size_t i = 0; i < ARRAYSIZE(fileNames); ++i)
+	{
+		std::wstring filepath = wpt10Dir_ + fileNames[i];
+		if (PathFileExists(filepath.c_str()))
+			filePaths.push_back(std::move(filepath));
+	}
+
+	if (!filePaths.empty())
+		DeleteFiles(*this, filePaths);
+
+#if defined(_WIN64)
+	const std::wstring symsrv_path = CanonicalizePath(wpt10Dir_ + L"..\\Debuggers\\x64\\symsrv.dll");
+#else
+	const std::wstring symsrv_path = CanonicalizePath(wpt10Dir_ + L"..\\Debuggers\\x86\\symsrv.dll");
+#endif
+	if (!PathFileExists(symsrv_path.c_str()))
+	{
+		AfxMessageBox((L"symsrv.dll (" + symsrv_path +
+			L") not found. Be sure to install the Windows 10 Anniversary Edition Debuggers "
+			L"or else symbol servers will not work.").c_str());
+	}
+
+	// Previous versions of symsrv.dll may not be multithreading safe and therefore can't
+	// be used with the latest WPA.
+	const int64_t requiredSymsrvVersion = (10llu << 48) + 0 + (14321llu << 16) + (1024llu << 0);
+	const auto symsrvVersion = GetFileVersion(symsrv_path);
+	if (symsrvVersion < requiredSymsrvVersion)
+	{
+		AfxMessageBox((L"symsrv.dll (" + symsrv_path +
+			L") is not the required version (10.0.14321.1024 or higher). "
+			L"Be sure to install the Windows 10 Anniversary Edition Debuggers "
+			L"or else symbol servers will not work.").c_str());
+	}
+}
+
 BOOL CUIforETWDlg::OnInitDialog()
 {
 	CDialog::OnInitDialog();
@@ -256,15 +351,30 @@ BOOL CUIforETWDlg::OnInitDialog()
 
 	CRect windowRect;
 	GetWindowRect(&windowRect);
-	initialWidth_ = lastWidth_ = windowRect.Width();
-	initialHeight_ = lastHeight_ = windowRect.Height();
+	initialWidth_ = minWidth_ = lastWidth_ = windowRect.Width();
+	initialHeight_ = minHeight_ = lastHeight_ = windowRect.Height();
 
-	// Win+Ctrl+C is used to trigger recording of traces. This is compatible with
-	// wprui. If this is changed then be sure to change the button text.
-	if (!RegisterHotKey(*this, kRecordTraceHotKey, MOD_WIN + MOD_CONTROL, 'C'))
+	// Ensure previousWidth_ and previousHeight_ are valid
+	if (previousWidth_ < initialWidth_)
+	{
+		previousWidth_ = initialWidth_;
+	}
+
+	if (previousHeight_ < initialHeight_)
+	{
+		previousHeight_ = initialHeight_;
+	}
+
+	// Win+Ctrl+R is used to trigger recording of traces. This is compatible with
+	// wprui. If this is changed then be sure to change the text on *both* buttons
+	// in the main window.
+	// It used to be Win+Ctrl+C but the Fall Creators [sic] Update stole that
+	// shortcut, globally, which I think is a really rude thing to do.
+	if (!RegisterHotKey(*this, kRecordTraceHotKey, MOD_WIN + MOD_CONTROL, 'R'))
 	{
 		AfxMessageBox(L"Couldn't register hot key.");
 		btSaveTraceBuffers_.SetWindowTextW(L"Sa&ve Trace Buffers");
+		btStartTracing_.SetWindowTextW(L"Start &Tracing");
 	}
 
 	// Add "About..." menu item to system menu.
@@ -301,21 +411,45 @@ BOOL CUIforETWDlg::OnInitDialog()
 	systemDrive_ = static_cast<char>(windowsDir_[0]);
 	systemDrive_ += ":\\";
 
-	// The WPT 8.1 installer is always a 32-bit installer, so we look for it in
-	// ProgramFilesX86, on 32-bit and 64-bit operating systems.
-	wchar_t* progFilesx86Dir = nullptr;
-	if (!SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFilesX86, 0, NULL, &progFilesx86Dir)))
-		std::terminate();
-	windowsKitsDir_ = progFilesx86Dir;
-	CoTaskMemFree(progFilesx86Dir);
-	progFilesx86Dir = nullptr;
 
-	windowsKitsDir_ += L"\\Windows Kits\\";
-	wpt81Dir_ = windowsKitsDir_ + L"8.1\\Windows Performance Toolkit\\";
-	wpt10Dir_ = windowsKitsDir_ + L"10\\Windows Performance Toolkit\\";
+	// The WPT installer is always a 32-bit installer, so we look for it in
+	// ProgramFilesX86 / WOW6432Node, on 32-bit and 64-bit operating systems.
+	wpt81Dir_ = ReadRegistryString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Microsoft SDKs\\Windows\\v8.1", L"InstallationFolder", true);
+	wpt10Dir_ = ReadRegistryString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Microsoft SDKs\\Windows\\v10.0", L"InstallationFolder", true);
+	if (!wpt81Dir_.empty())
+	{
+		EnsureEndsWithDirSeparator(wpt81Dir_);
+		wpt81Dir_ += L"Windows Performance Toolkit\\";
+	}
+	if (!wpt10Dir_.empty())
+	{
+		EnsureEndsWithDirSeparator(wpt10Dir_);
+		wpt10Dir_ += L"Windows Performance Toolkit\\";
+	}
+
+	// If the registry entries were unavailable, fall back to assuming their installation directory.
+	if (wpt81Dir_.empty() || wpt10Dir_.empty())
+	{
+		wchar_t* progFilesx86Dir = nullptr;
+		if (!SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFilesX86, 0, nullptr, &progFilesx86Dir)))
+			std::terminate();
+		std::wstring windowsKitsDir = progFilesx86Dir;
+		CoTaskMemFree(progFilesx86Dir);
+		windowsKitsDir += L"\\Windows Kits\\";
+		if (wpt81Dir_.empty())
+		{
+			wpt81Dir_ = windowsKitsDir + L"8.1\\Windows Performance Toolkit\\";
+		}
+		if (wpt10Dir_.empty())
+		{
+			wpt10Dir_ = windowsKitsDir + L"10\\Windows Performance Toolkit\\";
+		}
+	}
 
 	auto xperfVersion = GetFileVersion(GetXperfPath());
 	const int64_t requiredXperfVersion = (10llu << 48) + 0 + (10586llu << 16) + (15llu << 0);
+	// Windows 10 April 2018 version - requires Windows 8 or higher?
+	const int64_t preferredXperfVersion = (10llu << 48) + 0 + (17134llu << 16) + (12llu << 0);
 
 	wchar_t systemDir[MAX_PATH];
 	systemDir[0] = 0;
@@ -324,25 +458,55 @@ BOOL CUIforETWDlg::OnInitDialog()
 
 	if (Is64BitWindows() && PathFileExists(msiExecPath.c_str()))
 	{
-		// Install 64-bit WPT 10 if needed and if available.
 		// The installers are available as part of etwpackage.zip on
 		// https://github.com/google/UIforETW/releases
-		if (xperfVersion < requiredXperfVersion)
+		if (IsWindowsSevenOrLesser())
 		{
-			const std::wstring installPath10 = CanonicalizePath(GetExeDir() + L"..\\third_party\\wpt10\\WPTx64-x86_en-us.msi");
-			if (PathFileExists(installPath10.c_str()))
+			// The newest (Anniversary Edition or beyond) WPT doesn't work on Windows 7.
+			// Install the older 64-bit WPT 10 if needed and if available.
+			if (xperfVersion < requiredXperfVersion)
 			{
-				ChildProcess child(msiExecPath);
-				std::wstring args = L" /i \"" + installPath10 + L"\"";
-				child.Run(true, L"msiexec.exe" + args);
-				DWORD installResult10 = child.GetExitCode();
-				if (!installResult10)
+				const std::wstring installPathOld10 = CanonicalizePath(GetExeDir() + L"..\\third_party\\oldwpt10\\WPTx64-x86_en-us.msi");
+				if (PathFileExists(installPathOld10.c_str()))
 				{
-					outputPrintf(L"WPT version 10 was installed.\n");
+					ChildProcess child(msiExecPath);
+					std::wstring args = L" /i \"" + installPathOld10 + L"\"";
+					child.Run(true, L"msiexec.exe" + args);
+					const DWORD installResult10 = child.GetExitCode();
+					if (!installResult10)
+					{
+						outputPrintf(L"WPT version 10.0.10586 was installed.\n");
+					}
+					else
+					{
+						outputPrintf(L"Failure code %u while installing WPT 10.\n", installResult10);
+					}
 				}
-				else
+			}
+		}
+		else
+		{
+			// Install 64-bit WPT 10 if needed and if available.
+			if (xperfVersion < preferredXperfVersion)
+			{
+				const std::wstring installPath10 = CanonicalizePath(GetExeDir() + L"..\\third_party\\wpt10\\WPTx64-x86_en-us.msi");
+				if (PathFileExists(installPath10.c_str()))
 				{
-					outputPrintf(L"Failure code %u while installing WPT 10.\n", installResult10);
+					ChildProcess child(msiExecPath);
+					std::wstring args = L" /i \"" + installPath10 + L"\"";
+					child.Run(true, L"msiexec.exe" + args);
+					const DWORD installResult10 = child.GetExitCode();
+					if (!installResult10)
+					{
+						xperfVersion = GetFileVersion(GetXperfPath());
+						outputPrintf(L"WPT version %llu.%llu.%llu.%llu was installed.\n",
+							xperfVersion >> 48, (xperfVersion >> 32) & 0xFFFF,
+							(xperfVersion >> 16) & 0xFFFF, xperfVersion & 0xFFFF);
+					}
+					else
+					{
+						outputPrintf(L"Failure code %u while installing WPT 10.\n", installResult10);
+					}
 				}
 			}
 			xperfVersion = GetFileVersion(GetXperfPath());
@@ -366,14 +530,26 @@ BOOL CUIforETWDlg::OnInitDialog()
 		else
 		{
 			if (xperfVersion)
-				AfxMessageBox((GetXperfPath() + L" must be version 10.0.10586.15 or higher. If you run UIforETW from etwpackage.zip\n"
-					L"from https://github.com/google/UIforETW/releases\n"
-					L"then WPT will be automatically installed. Exiting.").c_str());
+				AfxMessageBox((GetXperfPath() + L" must be version 10.0.10586.15 or higher. You'll need to find the installer in the "
+					L"Windows 10 SDK or you can xcopy install it. Exiting.").c_str());
 			else
-				AfxMessageBox((GetXperfPath() + L" does not exist. You'll need to find the installer in the Windows "
-				L"Windows 10, Version 1511 SDK. Exiting.").c_str());
+				AfxMessageBox((GetXperfPath() + L" does not exist. You'll need to find the installer in the "
+					L"Windows 10 SDK or you can xcopy install it. Exiting.").c_str());
 		}
 		exit(10);
+	}
+
+	if (xperfVersion >= preferredXperfVersion)
+	{
+		if (IsWindowsSevenOrLesser())
+		{
+			AfxMessageBox(L"The installed version of Windows Performance Toolkit is not compatible with Windows 7. "
+				L"Please uninstall it and run UIforETW again.");
+		}
+		else
+		{
+			CheckSymbolDLLs();
+		}
 	}
 
 	if (!PathFileExists((wpt81Dir_ + L"xperf.exe").c_str()))
@@ -398,7 +574,9 @@ BOOL CUIforETWDlg::OnInitDialog()
 	UIETWASSERT(getMyDocsResult);
 	if (!getMyDocsResult)
 	{
+#ifdef OUTPUT_DEBUG_STRINGS
 		OutputDebugStringA("Failed to find My Documents directory.\r\n");
+#endif
 		exit(10);
 	}
 	std::wstring defaultTraceDir = documents + std::wstring(L"\\etwtraces\\");
@@ -522,6 +700,10 @@ BOOL CUIforETWDlg::OnInitDialog()
 	if (bVersionChecks_)
 		versionCheckerThread_.StartVersionCheckerThread(this);
 
+	const UINT flags = SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_NOACTIVATE;
+	// Resize our window per the previous dimensions if we have them
+	SetWindowPos(nullptr, 0, 0, previousWidth_, previousHeight_, flags);
+
 	return TRUE; // return TRUE unless you set the focus to a control
 }
 
@@ -567,10 +749,15 @@ void CUIforETWDlg::RegisterProviders()
 	// Be sure to register the version of the DLLs that we are actually using.
 	// This is important when adding new provider tasks, but should not otherwise
 	// matter.
-	if (Is64BitBuild())
-		dllSource += L"ETWProviders64.dll";
-	else
-		dllSource += L"ETWProviders.dll";
+#ifdef _M_ARM64
+	dllSource += L"ETWProvidersARM64.dll";
+#elif _M_X64
+	dllSource += L"ETWProviders64.dll";
+#elif _M_IX86
+	dllSource += L"ETWProviders.dll";
+#else
+#error Unknown CPU type
+#endif
 	const std::wstring temp = GetEnvironmentVariableString(L"temp");
 	if (temp.empty())
 		return;
@@ -625,7 +812,7 @@ void CUIforETWDlg::RegisterProviders()
 			child.Run(bShowCommands_, L"wevtutil.exe" + args);
 			if (pass)
 			{
-				DWORD exitCode = child.GetExitCode();
+				const DWORD exitCode = child.GetExitCode();
 				if (!exitCode)
 				{
 					useChromeProviders_ = true;
@@ -648,7 +835,7 @@ void CUIforETWDlg::DisablePagingExecutive()
 	}
 }
 
-void CUIforETWDlg::UpdateEnabling()
+void CUIforETWDlg::UpdateEnabling() noexcept
 {
 	SmartEnableWindow(btStartTracing_.m_hWnd, !bIsTracing_);
 	SmartEnableWindow(btSaveTraceBuffers_.m_hWnd, bIsTracing_);
@@ -658,7 +845,7 @@ void CUIforETWDlg::UpdateEnabling()
 	SmartEnableWindow(btSampledStacks_.m_hWnd, !bIsTracing_);
 	SmartEnableWindow(btCswitchStacks_.m_hWnd, !bIsTracing_);
 	SmartEnableWindow(btGPUTracing_.m_hWnd, !bIsTracing_);
-	SmartEnableWindow(btCLRTracing_.m_hWnd, !bIsTracing_ );
+	SmartEnableWindow(btCLRTracing_.m_hWnd, !bIsTracing_);
 }
 
 void CUIforETWDlg::OnSysCommand(UINT nID, LPARAM lParam)
@@ -687,12 +874,12 @@ void CUIforETWDlg::OnPaint()
 		SendMessage(WM_ICONERASEBKGND, reinterpret_cast<WPARAM>(dc.GetSafeHdc()), 0);
 
 		// Center icon in client rectangle
-		int cxIcon = GetSystemMetrics(SM_CXICON);
-		int cyIcon = GetSystemMetrics(SM_CYICON);
+		const int cxIcon = GetSystemMetrics(SM_CXICON);
+		const int cyIcon = GetSystemMetrics(SM_CYICON);
 		CRect rect;
 		GetClientRect(&rect);
-		int x = (rect.Width() - cxIcon + 1) / 2;
-		int y = (rect.Height() - cyIcon + 1) / 2;
+		const int x = (rect.Width() - cxIcon + 1) / 2;
+		const int y = (rect.Height() - cyIcon + 1) / 2;
 
 		// Draw the icon
 		dc.DrawIcon(x, y, m_hIcon);
@@ -705,9 +892,10 @@ void CUIforETWDlg::OnPaint()
 
 // The system calls this function to obtain the cursor to display while the user drags
 // the minimized window.
-HCURSOR CUIforETWDlg::OnQueryDragIcon()
+HCURSOR CUIforETWDlg::OnQueryDragIcon() noexcept
 {
-	return static_cast<HCURSOR>(m_hIcon);
+	// HCURSOR and HICON are the same type, so no cast is needed.
+	return m_hIcon;
 }
 
 
@@ -774,9 +962,15 @@ void CUIforETWDlg::StartEventThreads()
 	// that has run "too long". Checking every thirty seconds should be fine.
 	SetTimer(kTimerID, 30000, nullptr);
 
-	CPUFrequencyMonitor_.StartThreads();
-	PowerMonitor_.StartThreads();
-	workingSetThread_.StartThreads();
+	if (bBackgroundMonitoring_)
+	{
+		CPUFrequencyMonitor_.StartThreads();
+		workingSetThread_.StartThreads();
+	}
+	PowerMonitor_.SetPerfCounters(perfCounters_);
+	PowerMonitor_.StartThreads(bBackgroundMonitoring_ ?
+		CPowerStatusMonitor::MonitorType::HeavyLoad :
+		CPowerStatusMonitor::MonitorType::LightLoad);
 }
 
 void CUIforETWDlg::StopEventThreads()
@@ -794,31 +988,74 @@ void CUIforETWDlg::StopEventThreads()
 void CUIforETWDlg::OnBnClickedStarttracing()
 {
 	RegisterProviders();
-	StartEventThreads();
 	if (tracingMode_ == kTracingToMemory)
 		outputPrintf(L"\nStarting tracing to in-memory circular buffers...\n");
 	else if (tracingMode_ == kTracingToFile)
 		outputPrintf(L"\nStarting tracing to disk...\n");
 	else if (tracingMode_ == kHeapTracingToFile)
-		outputPrintf(L"\nStarting heap tracing to disk of %s...\n", heapTracingExes_.c_str());
+	{
+		auto heapSettings = ParseHeapTracingSettings(heapTracingExes_);
+		if (heapSettings.pathName.size())
+		{
+			outputPrintf(L"");
+			// Launch and heap-profile the specified process, handy for heap-profiling
+			// the browser process from startup.
+			outputPrintf(L"\nLaunching and heap tracing to disk %s...\n", heapSettings.pathName.c_str());
+		}
+		else if (heapSettings.processIDs.size())
+		{
+			// Heap profile the processes specified by the PIDs (maximum of two).
+			outputPrintf(L"\nStarting heap tracing to disk of PIDs %s...\n", heapSettings.processIDs.c_str());
+		}
+		else
+		{
+			std::wstring processNames;
+			for (auto& name : heapSettings.processNames)
+			{
+				if (processNames.size() > 0)
+					processNames += L" and ";
+				processNames += name;
+			}
+			outputPrintf(L"\nStarting heap tracing to disk of the %s processes...\n", processNames.c_str());
+		}
+	}
 	else
 		UIETWASSERT(0);
 
+	{
+		// Force any existing sessions to stop. This makes starting tracing much more robust.
+		// Never show the commands executing, and never print the exit code.
+		ChildProcess child(GetXperfPath(), false);
+		child.Run(false, L"xperf.exe -stop UIforETWHeapSession -stop UIforETWSession -stop " + GetKernelLogger());
+		// Swallow all of the output so that the normal failures will be silent.
+		child.GetOutput();
+	}
+
 	std::wstring kernelProviders = L" Latency+POWER+DISPATCHER+DISK_IO_INIT+FILE_IO+FILE_IO_INIT+VIRT_ALLOC+MEMINFO";
+	bool cswitch_and_profile = true;
+	if (tracingMode_ == kHeapTracingToFile)
+	{
+		// Latency = PROC_THREAD+LOADER+DISK_IO+HARD_FAULTS+DPC+INTERRUPT+CSWITCH+PROFILE,
+		// but we don't need all that for heap tracing. The minimum set is PROC_THREAD+LOADER
+		// and we add on VIRT_ALLOC+MEMINFO because that seems appropriate for heap tracing.
+		kernelProviders = L" PROC_THREAD+LOADER+VIRT_ALLOC+MEMINFO";
+		cswitch_and_profile = false;
+	}
 	if (!extraKernelFlags_.empty())
 		kernelProviders += L"+" + extraKernelFlags_;
 	std::wstring kernelStackWalk;
 	// Record CPU sampling call stacks, from the PROFILE provider
-	if (bSampledStacks_)
-		kernelStackWalk += L"+PROFILE";
+	if (bSampledStacks_ && cswitch_and_profile)
+		kernelStackWalk += L"+Profile";
 	// Record context-switch (switch in) and readying-thread (SetEvent, etc.)
 	// call stacks from DISPATCHER provider.
-	if (bCswitchStacks_)
-		kernelStackWalk += L"+CSWITCH+READYTHREAD";
-	// Record VirtualAlloc call stacks from the VIRT_ALLOC provider. Could
-	// also record VirtualFree.
+	if (bCswitchStacks_ && cswitch_and_profile)
+		kernelStackWalk += L"+CSwitch+ReadyThread";
+	// Record VirtualAlloc call stacks from the VIRT_ALLOC provider. Also
+	// record VirtualFree to allow investigation of memory leaks, even though
+	// WPA fails to display these stacks.
 	if (bVirtualAllocStacks_ || tracingMode_ == kHeapTracingToFile)
-		kernelStackWalk += L"+VirtualAlloc";
+		kernelStackWalk += L"+VirtualAlloc+VirtualFree";
 	// Add in any manually requested call stack flags.
 	if (!extraKernelStacks_.empty())
 		kernelStackWalk += L"+" + extraKernelStacks_;
@@ -858,13 +1095,36 @@ void CUIforETWDlg::OnBnClickedStarttracing()
 	userProviders += L"+Microsoft-Windows-Kernel-Memory:0xE0";
 
 	if (!extraUserProviders_.empty())
-		userProviders += L"+" + extraUserProviders_;
+	{
+		try
+		{
+			userProviders += TranslateUserModeProviders(extraUserProviders_);
+		}
+		catch (const std::exception& e)
+		{
+			outputPrintf(L"Check the extra user providers; failed to translate them from the TraceLogging name to a GUID.\n%hs\n", e.what());
+			return;
+		}
+	}
 
 	// DWM providers can be helpful also. Uncomment to enable.
 	//userProviders += L"+Microsoft-Windows-Dwm-Dwm";
-	// Theoretically better power monitoring data, Windows 7+, but it doesn't
-	// seem to work.
-	//userProviders += L"+Microsoft-Windows-Kernel-Processor-Power+Microsoft-Windows-Kernel-Power";
+
+	// Monitoring of timer frequency changes from timeBeginPeriod and
+	// NtSetTimerResolution. Windows 7 and above.
+	// Like most providers the information provide by this one is undocumented and
+	// therefore only easily usable by those who created it. However, a bit of
+	// exploration will find useful information. The timer changes are contained
+	// in events such as SystemTimeResolutionChange and SystemTimeResolutionKernelChange
+	// for changes by normal processes and the kernel.
+	// The "Randomascii System Time Resolution" preset for the Generic Events is set up
+	// with a filter to show just these events. To configure this filtering I used the
+	// View Editor, Advanced, and the syntax that is lightly documented here:
+	// https://msdn.microsoft.com/en-us/windows/hardware/commercialize/test/wpt/wpa-query-syntax
+	// Look at SystemTimeResolutionChange and SystemTimeResolutionKernelChange, and in
+	// particular at the RequestedResolution field (units are 0.1 microseconds, so 
+	// 0x2710 == 10,000 = 1 ms).
+	userProviders += L"+Microsoft-Windows-Kernel-Power";
 
 	// If the Chrome providers were successfully registered and if the user has requested tracing
 	// some of Chrome's categories (keywords/flags) then add chrome:flags to the list of user
@@ -899,7 +1159,7 @@ void CUIforETWDlg::OnBnClickedStarttracing()
 		// CLR runtime provider
 		// https://msdn.microsoft.com/en-us/library/ff357718(v=vs.100).aspx
 		userProviders += L"+e13c0d23-ccbc-4e12-931b-d9cc2eee27e4:0x1CCBD:0x5";
-        
+
 		// note: this seems to be an updated version of
 		// userProviders += L"+ClrAll:0x98:5";
 		// which results in Invalid flags. (0x3ec) when I run it
@@ -914,18 +1174,79 @@ void CUIforETWDlg::OnBnClickedStarttracing()
 		userFile = L" -buffering";
 	std::wstring userArgs = L" -start UIforETWSession -on " + userProviders + userBuffers + userFile;
 
-	// Heap tracing settings -- only used for heap tracing.
-	// Could also record stacks on HeapFree
-	// Buffer sizes need to be huge for some programs - should be configurable.
-	const int numHeapBuffers = BufferCountBoost(1000);
-	std::wstring heapBuffers = stringPrintf(L" -buffersize 1024 -minbuffers %d -maxBuffers %d", numHeapBuffers, numHeapBuffers);
-	std::wstring heapFile = L" -f \"" + GetHeapFile() + L"\"";
-	std::wstring heapStackWalk;
-	if (bHeapStacks_)
-		heapStackWalk = L" -stackwalk HeapCreate+HeapDestroy+HeapAlloc+HeapRealloc";
-	std::wstring heapArgs = L" -start xperfHeapSession -heap -Pids 0" + heapStackWalk + heapBuffers + heapFile;
+	std::wstring heapArgs;
+	if (tracingMode_ == kHeapTracingToFile)
+	{
+		// Heap tracing settings -- only used for heap tracing.
+		// Could also record stacks on HeapFree
+		// Buffer sizes need to be huge for some programs - should be configurable.
+		const int numHeapBuffers = BufferCountBoost(1000);
+		std::wstring heapBuffers = stringPrintf(L" -buffersize 1024 -minbuffers %d -maxBuffers %d", numHeapBuffers, numHeapBuffers);
+		std::wstring heapFile = L" -f \"" + GetHeapFile() + L"\"";
+		std::wstring heapStackWalk;
+		if (bHeapStacks_)
+			heapStackWalk = L" -stackwalk HeapCreate+HeapDestroy+HeapAlloc+HeapRealloc";
+		auto heapSettings = ParseHeapTracingSettings(heapTracingExes_);
+		if (heapSettings.pathName.size())
+		{
+			// Launch and heap-profile the specified process, handy for heap-profiling
+			// the browser process from startup.
+			heapArgs = L" -start UIforETWHeapSession -heap -PidNewProcess \"" + heapSettings.pathName + L"\"" + heapStackWalk + heapBuffers + heapFile;
+		}
+		else if (heapSettings.processIDs.size())
+		{
+			// Heap profile the processes specified by the PIDs (maximum of two).
+			heapArgs = L" -start UIforETWHeapSession -heap -Pids " + heapSettings.processIDs + heapStackWalk + heapBuffers + heapFile;
+		}
+		else if (heapSettings.processNames.size())
+		{
+			// Heap profile the processes specified by heapSettings.processNames that
+			// were launched when the registry key was set (when "Heap tracing to file"
+			// was the selected tracing type).
+			heapArgs = L" -start UIforETWHeapSession -heap -Pids 0" + heapStackWalk + heapBuffers + heapFile;
+		}
+		else
+		{
+			outputPrintf(L"Error: no heap-profiled processes settings found. Go to the Settings dialog to configure them.\n");
+			return;
+		}
+	}
+
+	StartEventThreads();
+
+	bPreTraceRecorded_ = false;
 
 	DWORD exitCode = 0;
+	bool started = true;
+	if (tracingMode_ == kTracingToFile && bRecordPreTrace_)
+	{
+		// Implement the fix to https://github.com/google/UIforETW/issues/97
+		// Grab an initial trace that will contain imageID, fileversion, etc., so that ETW
+		// traces that cover a Chrome upgrade will get before and after information.
+		const std::wstring imageIDCommands[] = {
+			// Start tracing with minimal flags
+			L"xperf.exe -start " + GetKernelLogger() + L" -on PROC_THREAD+LOADER -f \"" + GetTempImageTraceFile() + L"\"",
+			// Immediately stop tracing
+			L"xperf.exe -stop " + GetKernelLogger(),
+			// Merge just the image ID information over to GetFinalImageTraceFile()
+			L"xperf.exe -merge \"" + GetTempImageTraceFile() + L"\" \"" + GetFinalImageTraceFile() + L"\" -injectonly",
+		};
+
+		outputPrintf(L"Recording pre-trace image data...\n");
+		for (auto& command : imageIDCommands)
+		{
+			ChildProcess child(GetXperfPath());
+
+			started = child.Run(bShowCommands_, command);
+			(void)child.GetOutput(); // Swallow output - failures and status are to be ignored.
+			exitCode = child.GetExitCode();
+			if (!started || exitCode)
+				break;
+		}
+		if (started && !exitCode)
+			bPreTraceRecorded_ = true;
+	}
+
 	{
 		ChildProcess child(GetXperfPath());
 
@@ -933,11 +1254,12 @@ void CUIforETWDlg::OnBnClickedStarttracing()
 			startupCommand_ = L"xperf.exe" + kernelArgs + userArgs + heapArgs;
 		else
 			startupCommand_ = L"xperf.exe" + kernelArgs + userArgs;
-		child.Run(bShowCommands_, startupCommand_);
+		started = child.Run(bShowCommands_, startupCommand_);
 
 		exitCode = child.GetExitCode();
-		if (exitCode)
+		if (exitCode || !started)
 		{
+			started = false;
 			outputPrintf(L"Error starting tracing. Try stopping tracing and then starting it again?\n");
 			//  NT Kernel Logger: Cannot create a file when that file already exists. (0xb7).
 			if (exitCode == 0x800700b7)
@@ -972,7 +1294,7 @@ void CUIforETWDlg::OnBnClickedStarttracing()
 
 	// Don't run the -capturestate step unless the previous step succeeded.
 	// Otherwise the error messages build up and get ever more confusing.
-	if (exitCode == 0)
+	if (started)
 	{
 		// Run -capturestate on the user-mode loggers, for reliable captures.
 		// If this step is skipped then GPU usage data will not be recorded on
@@ -1016,13 +1338,13 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 	// Note that this has to be done before the -flush step -- it makes both it
 	// and the -merge step painfully slow.
 	DeleteFile(compatFileTemp.c_str());
-	BOOL moveSuccess = MoveFile(compatFile.c_str(), compatFileTemp.c_str());
+	const BOOL moveSuccess = MoveFile(compatFile.c_str(), compatFileTemp.c_str());
 	// Don't print this message - it just cause confusion, especially since the renaming fails
 	// on most machines without it mattering.
 	//if (bShowCommands_ && !moveSuccess)
 	//	outputPrintf(L"Failed to rename %s to %s\n", compatFile.c_str(), compatFileTemp.c_str());
 
-	ElapsedTimer saveTimer;
+	const ElapsedTimer saveTimer;
 	{
 		// Stop the kernel and user sessions.
 		ChildProcess child(GetXperfPath());
@@ -1032,6 +1354,9 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 				ETWMarkPrintf("Chrome ETW events were requested with keyword 0x%llx", chromeKeywords_);
 			// Record the entire xperf startup command to the trace.
 			ETWMarkWPrintf(L"Tracing startup command was: %s", startupCommand_.c_str());
+			LARGE_INTEGER frequency;
+			QueryPerformanceFrequency(&frequency);
+			ETWMarkWPrintf(L"QueryPerformanceFrequency is %1.3f MHz", frequency.QuadPart / 1e6);
 		}
 		if (bSaveTrace && tracingMode_ == kTracingToMemory)
 		{
@@ -1049,7 +1374,7 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 			if (tracingMode_ == kHeapTracingToFile)
 			{
 				ETWMark("Tracing type was heap tracing to file.");
-				child.Run(bShowCommands_, L"xperf.exe -stop xperfHeapSession -stop UIforETWSession -stop " + GetKernelLogger());
+				child.Run(bShowCommands_, L"xperf.exe -stop UIforETWHeapSession -stop UIforETWSession -stop " + GetKernelLogger());
 			}
 			else
 			{
@@ -1060,7 +1385,7 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 			StopEventThreads();
 		}
 	}
-	double saveTime = saveTimer.ElapsedSeconds();
+	const double saveTime = saveTimer.ElapsedSeconds();
 	if (bShowCommands_ && bSaveTrace)
 		outputPrintf(L"Trace save took %1.1f s\n", saveTime);
 
@@ -1068,7 +1393,7 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 	if (bSaveTrace)
 	{
 		outputPrintf(L"Merging trace...\n");
-		ElapsedTimer mergeTimer;
+		const ElapsedTimer mergeTimer;
 		{
 			// Separate merge step to allow compression on Windows 8+
 			// https://randomascii.wordpress.com/2015/03/02/etw-trace-compression-and-xperf-syntax-refresher/
@@ -1076,6 +1401,8 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 			std::wstring args = L" -merge \"" + GetKernelFile() + L"\" \"" + GetUserFile() + L"\"";
 			if (tracingMode_ == kHeapTracingToFile)
 				args += L" \"" + GetHeapFile() + L"\"";
+			if (bPreTraceRecorded_)
+				args += L" \"" + GetFinalImageTraceFile() + L"\"";
 			args += L" \"" + traceFilename + L"\"";
 			if (bCompress_)
 				args += L" -compress";
@@ -1103,7 +1430,11 @@ void CUIforETWDlg::StopTracingAndMaybeRecord(bool bSaveTrace)
 
 	if (bSaveTrace)
 	{
-		if (bChromeDeveloper_)
+		// It looks like all of the Chrome symbol processing bugs (slow symbol
+		// processing for various reasons and an inability to download symbols from
+		// Chrome's symbol server) are fixed in Creators Edition, so disable this
+		// hack, except for those on Windows 7 who can't use the latest version.
+		if (IsWindowsSevenOrLesser() && bChromeDeveloper_)
 			StripChromeSymbols(traceFilename);
 		PreprocessTrace(traceFilename);
 
@@ -1151,7 +1482,7 @@ void CUIforETWDlg::OnTimer(UINT_PTR)
 {
 	if (bIsTracing_ && (tracingMode_ == kTracingToFile || tracingMode_ == kHeapTracingToFile))
 	{
-		ULONGLONG elapsed = GetTickCount64() - traceStartTime_;
+		const ULONGLONG elapsed = GetTickCount64() - traceStartTime_;
 		if (elapsed > kMaxFileTraceMs)
 		{
 			outputPrintf(L"\nTracing to disk ran excessively long. Auto-saving and stopping.\n");
@@ -1197,7 +1528,7 @@ void CUIforETWDlg::LaunchTraceViewer(const std::wstring traceFilename, const std
 	wcscpy_s(&argsCopy[0], argsCopy.size(), args.c_str());
 	STARTUPINFO startupInfo = {};
 	PROCESS_INFORMATION processInfo = {};
-	BOOL result = CreateProcess(viewerPath.c_str(), &argsCopy[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startupInfo, &processInfo);
+	const BOOL result = CreateProcess(viewerPath.c_str(), &argsCopy[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startupInfo, &processInfo);
 	if (result)
 	{
 		// Close the handles to avoid leaks.
@@ -1210,25 +1541,25 @@ void CUIforETWDlg::LaunchTraceViewer(const std::wstring traceFilename, const std
 	}
 }
 
-void CUIforETWDlg::OnBnClickedCompresstrace()
+void CUIforETWDlg::OnBnClickedCompresstrace() noexcept
 {
 	bCompress_ = !bCompress_;
 }
 
 
-void CUIforETWDlg::OnBnClickedCpusamplingcallstacks()
+void CUIforETWDlg::OnBnClickedCpusamplingcallstacks() noexcept
 {
 	bSampledStacks_ = !bSampledStacks_;
 }
 
 
-void CUIforETWDlg::OnBnClickedContextswitchcallstacks()
+void CUIforETWDlg::OnBnClickedContextswitchcallstacks() noexcept
 {
 	bCswitchStacks_ = !bCswitchStacks_;
 }
 
 
-void CUIforETWDlg::OnBnClickedShowcommands()
+void CUIforETWDlg::OnBnClickedShowcommands() noexcept
 {
 	bShowCommands_ = !bShowCommands_;
 }
@@ -1269,19 +1600,19 @@ void CUIforETWDlg::OnBnClickedFastsampling()
 }
 
 
-void CUIforETWDlg::OnBnClickedGPUtracing()
+void CUIforETWDlg::OnBnClickedGPUtracing() noexcept
 {
 	bGPUTracing_ = !bGPUTracing_;
 }
 
-void CUIforETWDlg::OnBnClickedClrtracing()
+void CUIforETWDlg::OnBnClickedClrtracing() noexcept
 {
 	bCLRTracing_ = !bCLRTracing_;
 }
 
 void CUIforETWDlg::OnCbnSelchangeInputtracing()
 {
-	InputTracing_ = (KeyLoggerState)btInputTracing_.GetCurSel();
+	InputTracing_ = static_cast<KeyLoggerState>(btInputTracing_.GetCurSel());
 	switch (InputTracing_)
 	{
 	case kKeyLoggerOff:
@@ -1308,7 +1639,7 @@ void CUIforETWDlg::UpdateTraceList()
 	lastTraceFilename_.clear();
 
 	int curSel = btTraces_.GetCurSel();
-	if (selectedTraceName.empty() && curSel >= 0 && curSel < (int)traces_.size())
+	if (selectedTraceName.empty() && curSel >= 0 && curSel < static_cast<int>(traces_.size()))
 	{
 		selectedTraceName = traces_[curSel];
 	}
@@ -1321,7 +1652,7 @@ void CUIforETWDlg::UpdateTraceList()
 	tempTraces.insert(tempTraces.end(), tempZips.begin(), tempZips.end());
 	std::sort(tempTraces.begin(), tempTraces.end());
 	// Function to stop the temporary traces from showing up.
-	auto ifInvalid = [](const std::wstring& name) { return name == L"kernel.etl" || name == L"user.etl" || name == L"heap.etl"; };
+	auto ifInvalid = [](const std::wstring& name) { return name == L"UIForETWkernel.etl" || name == L"UIForETWuser.etl" || name == L"UIForETWheap.etl"; };
 	tempTraces.erase(std::remove_if(tempTraces.begin(), tempTraces.end(), ifInvalid), tempTraces.end());
 	for (auto& name : tempTraces)
 	{
@@ -1342,7 +1673,7 @@ void CUIforETWDlg::UpdateTraceList()
 		btTraces_.SetRedraw(FALSE);
 		// Erase all entries and replace them.
 		btTraces_.ResetContent();
-		for (int curIndex = 0; curIndex < (int)traces_.size(); ++curIndex)
+		for (int curIndex = 0; curIndex < static_cast<int>(traces_.size()); ++curIndex)
 		{
 			const auto& name = traces_[curIndex];
 			btTraces_.AddString(name.c_str());
@@ -1354,8 +1685,8 @@ void CUIforETWDlg::UpdateTraceList()
 				curSel = curIndex;
 			}
 		}
-		if (curSel >= (int)traces_.size())
-			curSel = (int)traces_.size() - 1;
+		if (curSel >= static_cast<int>(traces_.size()))
+			curSel = static_cast<int>(traces_.size()) - 1;
 		btTraces_.SetCurSel(curSel);
 		btTraces_.SetRedraw(TRUE);
 	}
@@ -1381,7 +1712,7 @@ LRESULT CUIforETWDlg::NewVersionAvailable(WPARAM wParam, LPARAM /*lParam*/)
 		"The version you have installed is %1.2f and the new version is %1.2f.\n"
 		"Would you like to download the new version?", kCurrentVersion, newVersion.f);
 
-	int result = AfxMessageBox(message.c_str(), MB_YESNO);
+	const int result = AfxMessageBox(message.c_str(), MB_YESNO);
 	if (result == IDYES)
 		ShellExecute(*this, L"open", L"https://github.com/google/UIforETW/releases/", 0, L".", SW_SHOWNORMAL);
 	if (result == IDNO)
@@ -1393,15 +1724,15 @@ LRESULT CUIforETWDlg::NewVersionAvailable(WPARAM wParam, LPARAM /*lParam*/)
 
 void CUIforETWDlg::OnLbnDblclkTracelist()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 	// This check shouldn't be necessary, but who knows?
-	if (selIndex < 0 || selIndex >= (int)traces_.size())
+	if (selIndex < 0 || selIndex >= static_cast<int>(traces_.size()))
 		return;
 	std::wstring tracename = GetTraceDir() + traces_[selIndex] + L".etl";
 	LaunchTraceViewer(tracename, wpaDefaultPath());
 }
 
-void CUIforETWDlg::OnGetMinMaxInfo(MINMAXINFO* lpMMI)
+void CUIforETWDlg::OnGetMinMaxInfo(MINMAXINFO* lpMMI) noexcept
 {
 	if (!initialWidth_)
 		return;
@@ -1413,16 +1744,18 @@ void CUIforETWDlg::OnGetMinMaxInfo(MINMAXINFO* lpMMI)
 
 void CUIforETWDlg::OnSize(UINT nType, int /*cx*/, int /*cy*/)
 {
-	if (nType == SIZE_RESTORED && initialWidth_)
+	if ((nType == SIZE_RESTORED || nType == SIZE_MAXIMIZED) && initialWidth_)
 	{
 		FinishTraceRename();
 		// Calculate xDelta and yDelta -- the change in the window's size.
 		CRect windowRect;
 		GetWindowRect(&windowRect);
-		int xDelta = windowRect.Width() - lastWidth_;
+		const int xDelta = windowRect.Width() - lastWidth_;
 		lastWidth_ += xDelta;
-		int yDelta = windowRect.Height() - lastHeight_;
+		previousWidth_ = lastWidth_;
+		const int yDelta = windowRect.Height() - lastHeight_;
 		lastHeight_ += yDelta;
+		previousHeight_ = lastHeight_;
 
 		const UINT flags = SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_NOACTIVATE;
 
@@ -1437,7 +1770,7 @@ void CUIforETWDlg::OnSize(UINT nType, int /*cx*/, int /*cy*/)
 		CRect listRect;
 		btTraces_.GetWindowRect(&listRect);
 		btTraces_.SetWindowPos(nullptr, 0, 0, listRect.Width(), listRect.Height() + yDelta, flags);
-		int curSel = btTraces_.GetCurSel();
+		const int curSel = btTraces_.GetCurSel();
 		if (curSel != LB_ERR)
 		{
 			// Make the selected line visible.
@@ -1457,7 +1790,7 @@ void CUIforETWDlg::OnSize(UINT nType, int /*cx*/, int /*cy*/)
 			MoveControl(this, btSampledStacks_, xDelta, 0);
 			MoveControl(this, btFastSampling_, xDelta, 0);
 			MoveControl(this, btGPUTracing_, xDelta, 0);
-			MoveControl(this, btCLRTracing_, xDelta, 0 );
+			MoveControl(this, btCLRTracing_, xDelta, 0);
 			MoveControl(this, btInputTracingLabel_, xDelta, 0);
 			MoveControl(this, btInputTracing_, xDelta, 0);
 			MoveControl(this, btTracingMode_, xDelta, 0);
@@ -1484,8 +1817,8 @@ void CUIforETWDlg::UpdateNotesState()
 {
 	SaveNotesIfNeeded();
 
-	int curSel = btTraces_.GetCurSel();
-	if (curSel >= 0 && curSel < (int)traces_.size())
+	const int curSel = btTraces_.GetCurSel();
+	if (curSel >= 0 && curSel < static_cast<int>(traces_.size()))
 	{
 		SmartEnableWindow(btTraceNotes_.m_hWnd, true);
 		std::wstring traceName = traces_[curSel];
@@ -1498,11 +1831,21 @@ void CUIforETWDlg::UpdateNotesState()
 			traceNotes_ = newTraceNotes;
 			SetDlgItemText(IDC_TRACENOTES, traceNotes_.c_str());
 		}
+		auto trace_size = GetFileSize(GetTraceDir() + traceName + L".etl");
+		wchar_t buffer[500];
+		// Yep, base-10 MB. The numbers will not match what Windows File Explorer
+		// shows, but that's because it is wrong. Using base-10 means you can
+		// trivially change to bytes, or kB, or estimate how many traces will fit
+		// in a (base-10) 640 GB drive.
+		// https://randomascii.wordpress.com/2016/02/13/base-ten-for-almost-everything/
+		swprintf_s(buffer, L"Trace size: %.1f MB", trace_size / 1e6);
+		SetDlgItemText(IDC_TRACESIZE, buffer);
 	}
 	else
 	{
 		SmartEnableWindow(btTraceNotes_.m_hWnd, false);
 		SetDlgItemText(IDC_TRACENOTES, L"");
+		SetDlgItemText(IDC_TRACESIZE, L"Trace size:");
 	}
 }
 
@@ -1536,9 +1879,13 @@ LRESULT CUIforETWDlg::OnHotKey(WPARAM wParam, LPARAM /*lParam*/)
 	switch (wParam)
 	{
 	case kRecordTraceHotKey:
-		// Don't record a trace if we haven't started tracing.
+		// The magic hot key can be used to start or stop tracing. Doing both
+		// of these without having to change away from the app being profiled
+		// has been shown to be useful.
 		if (bIsTracing_)
 			StopTracingAndMaybeRecord(true);
+		else
+			OnBnClickedStarttracing();
 		break;
 	}
 
@@ -1580,20 +1927,26 @@ void CUIforETWDlg::SetHeapTracing(bool forceOff)
 	DWORD tracingFlags = tracingMode_ == kHeapTracingToFile ? 1 : 0;
 	if (forceOff)
 		tracingFlags = 0;
-	for (const auto& tracingName : split(heapTracingExes_, ';'))
+
+	auto heapSettings = ParseHeapTracingSettings(heapTracingExes_);
+
+	for (const auto& tracingName : heapSettings.processNames)
 	{
 		std::wstring targetKey = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
 		CreateRegistryKey(HKEY_LOCAL_MACHINE, targetKey, tracingName);
 		targetKey += L"\\" + tracingName;
+		DWORD oldValue = 0;
+		bool oldValueValid = GetRegistryDWORD(HKEY_LOCAL_MACHINE, targetKey, L"TracingFlags", &oldValue);
 		SetRegistryDWORD(HKEY_LOCAL_MACHINE, targetKey, L"TracingFlags", tracingFlags);
-		if (tracingFlags)
+		// Print a message when setting the flag or when clearing it if it was previously set.
+		if (tracingFlags || (oldValueValid && tracingFlags != oldValue))
 			outputPrintf(L"\"TracingFlags\" in \"HKEY_LOCAL_MACHINE\\%s\" set to %lu.\n", targetKey.c_str(), tracingFlags);
 	}
 }
 
 void CUIforETWDlg::OnCbnSelchangeTracingmode()
 {
-	tracingMode_ = (TracingMode)btTracingMode_.GetCurSel();
+	tracingMode_ = static_cast<TracingMode>(btTracingMode_.GetCurSel());
 	switch (tracingMode_)
 	{
 	case kTracingToMemory:
@@ -1604,10 +1957,7 @@ void CUIforETWDlg::OnCbnSelchangeTracingmode()
 		outputPrintf(L"Traces will be recorded to disk to allow arbitrarily long recordings.\n");
 		break;
 	case kHeapTracingToFile:
-		outputPrintf(L"Heap traces will be recorded to disk for %s. Note that only %s processes "
-			L"started after this is selected will be traced. \n"
-			L"To keep trace sizes manageable you may want to turn off context switch and CPU "
-			L"sampling call stacks.\n", heapTracingExes_.c_str(), heapTracingExes_.c_str());
+		outputPrintf(L"Heap traces will be recorded to disk.\n");
 		break;
 	}
 	SetHeapTracing(false);
@@ -1623,8 +1973,13 @@ void CUIforETWDlg::OnBnClickedSettings()
 	dlgSettings.extraKernelFlags_ = extraKernelFlags_;
 	dlgSettings.extraKernelStacks_ = extraKernelStacks_;
 	dlgSettings.extraUserProviders_ = extraUserProviders_;
+	dlgSettings.perfCounters_ = perfCounters_;
+	dlgSettings.bUseOtherKernelLogger_ = bUseOtherKernelLogger_;
+	dlgSettings.bBackgroundTracing_ = bBackgroundMonitoring_;
 	dlgSettings.bChromeDeveloper_ = bChromeDeveloper_;
+	dlgSettings.bIdentifyChromeProcessesCPU_ = bIdentifyChromeProcessesCPU_;
 	dlgSettings.bAutoViewTraces_ = bAutoViewTraces_;
+	dlgSettings.bRecordPreTrace_ = bRecordPreTrace_;
 	dlgSettings.bHeapStacks_ = bHeapStacks_;
 	dlgSettings.bVirtualAllocStacks_ = bVirtualAllocStacks_;
 	dlgSettings.bVersionChecks_ = bVersionChecks_;
@@ -1651,13 +2006,18 @@ void CUIforETWDlg::OnBnClickedSettings()
 			bChromeDeveloper_ = dlgSettings.bChromeDeveloper_;
 			SetSymbolPath();
 		}
+		bIdentifyChromeProcessesCPU_ = dlgSettings.bIdentifyChromeProcessesCPU_;
 
 		// Copy over the remaining settings.
+		bBackgroundMonitoring_ = dlgSettings.bBackgroundTracing_;
+		bUseOtherKernelLogger_ = dlgSettings.bUseOtherKernelLogger_;
+		bRecordPreTrace_ = dlgSettings.bRecordPreTrace_;
 		WSMonitoredProcesses_ = dlgSettings.WSMonitoredProcesses_;
 		bExpensiveWSMonitoring_ = dlgSettings.bExpensiveWSMonitoring_;
 		extraKernelFlags_ = dlgSettings.extraKernelFlags_;
 		extraKernelStacks_ = dlgSettings.extraKernelStacks_;
 		extraUserProviders_ = dlgSettings.extraUserProviders_;
+		perfCounters_ = dlgSettings.perfCounters_;
 		workingSetThread_.SetProcessFilter(WSMonitoredProcesses_, bExpensiveWSMonitoring_);
 
 		bAutoViewTraces_ = dlgSettings.bAutoViewTraces_;
@@ -1673,7 +2033,7 @@ void CUIforETWDlg::OnContextMenu(CWnd* pWnd, CPoint point)
 	// See if we right-clicked on the trace list.
 	if (pWnd == &btTraces_)
 	{
-		int selIndex = btTraces_.GetCurSel();
+		const int selIndex = btTraces_.GetCurSel();
 
 		CMenu PopupMenu;
 		PopupMenu.LoadMenu(IDR_TRACESCONTEXTMENU);
@@ -1722,6 +2082,7 @@ void CUIforETWDlg::OnContextMenu(CWnd* pWnd, CPoint point)
 				//ID_TRACES_BROWSEFOLDER,
 				ID_TRACES_STRIPCHROMESYMBOLS,
 				ID_TRACES_IDENTIFYCHROMEPROCESSES,
+				ID_TRACES_IDENTIFYCHROMEPROCESSESWITHCPU,
 				ID_TRACES_TRACEPATHTOCLIPBOARD,
 				ID_SCRIPTS_CREATEFLAMEGRAPH,
 			};
@@ -1738,7 +2099,7 @@ void CUIforETWDlg::OnContextMenu(CWnd* pWnd, CPoint point)
 			pContextMenu->EnableMenuItem(ID_TRACES_COMPRESSTRACES, MF_BYCOMMAND | MF_GRAYED);
 		}
 
-		int selection = pContextMenu->TrackPopupMenu(TPM_LEFTALIGN | TPM_LEFTBUTTON |
+		const int selection = pContextMenu->TrackPopupMenu(TPM_LEFTALIGN | TPM_LEFTBUTTON |
 			TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
 			point.x, point.y, pWnd, NULL);
 
@@ -1787,6 +2148,12 @@ void CUIforETWDlg::OnContextMenu(CWnd* pWnd, CPoint point)
 				IdentifyChromeProcesses(tracePath);
 				UpdateNotesState();
 				break;
+			case ID_TRACES_IDENTIFYCHROMEPROCESSESWITHCPU:
+				SaveNotesIfNeeded();
+				outputPrintf(L"\n");
+				IdentifyChromeProcesses(tracePath, true);
+				UpdateNotesState();
+				break;
 			case ID_SCRIPTS_CREATEFLAMEGRAPH:
 				CreateFlameGraph(tracePath);
 				break;
@@ -1805,7 +2172,7 @@ void CUIforETWDlg::OnContextMenu(CWnd* pWnd, CPoint point)
 
 void CUIforETWDlg::DeleteTrace()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 
 	if (selIndex >= 0)
 	{
@@ -1827,7 +2194,7 @@ void CUIforETWDlg::DeleteTrace()
 
 void CUIforETWDlg::CopyTraceName()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 
 	if (selIndex >= 0)
 	{
@@ -1844,7 +2211,7 @@ void CUIforETWDlg::CopyTraceName()
 
 void CUIforETWDlg::OnOpenTraceWPA()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 
 	if (selIndex >= 0)
 	{
@@ -1856,7 +2223,7 @@ void CUIforETWDlg::OnOpenTraceWPA()
 
 void CUIforETWDlg::OnOpenTrace10WPA()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 
 	if (selIndex >= 0)
 	{
@@ -1867,7 +2234,7 @@ void CUIforETWDlg::OnOpenTrace10WPA()
 
 void CUIforETWDlg::OnOpenTraceGPUView()
 {
-	int selIndex = btTraces_.GetCurSel();
+	const int selIndex = btTraces_.GetCurSel();
 
 	if (selIndex >= 0)
 	{
@@ -1922,7 +2289,7 @@ void CUIforETWDlg::CompressAllTraces() const
 	int compressedCount = 0;
 	for (const auto& traceName : traces_)
 	{
-		auto result = CompressTrace(GetTraceDir() + traceName + L".etl");
+		const auto result = CompressTrace(GetTraceDir() + traceName + L".etl");
 		if (result.first == result.second)
 		{
 			++notCompressedCount;
@@ -1951,7 +2318,7 @@ void CUIforETWDlg::StripChromeSymbols(const std::wstring& traceFilename)
 	if (!pythonPath.empty())
 	{
 		outputPrintf(L"Stripping Chrome symbols - this may take a while...\n");
-		ElapsedTimer stripTimer;
+		const ElapsedTimer stripTimer;
 		{
 			ChildProcess child(pythonPath);
 			// Must pass -u to disable Python's output buffering when printing to
@@ -1969,15 +2336,20 @@ void CUIforETWDlg::StripChromeSymbols(const std::wstring& traceFilename)
 }
 
 
-void CUIforETWDlg::IdentifyChromeProcesses(const std::wstring& traceFilename)
+void CUIforETWDlg::IdentifyChromeProcesses(const std::wstring& traceFilename, bool withCPU)
 {
-	outputPrintf(L"Preprocessing trace to identify Chrome processes...\n");
+	if (withCPU)
+		outputPrintf(L"Preprocessing trace to identify Chrome processes and summarize CPU usage. This may take a little while...\n");
+	else
+		outputPrintf(L"Preprocessing trace to identify Chrome processes...\n");
 	// There was a version of this that was written in C++. See the history for details.
 	std::wstring pythonPath = FindPython();
 	if (!pythonPath.empty())
 	{
 		ChildProcess child(pythonPath);
 		std::wstring args = L" -u \"" + GetExeDir() + L"IdentifyChromeProcesses.py\" \"" + traceFilename + L"\"";
+		if (withCPU)
+			args += L" --cpuusage";
 		child.Run(bShowCommands_, GetFilePart(pythonPath) + args);
 		std::wstring output = child.GetOutput();
 		// The output of the script is appended to the trace description file.
@@ -2015,7 +2387,7 @@ void CUIforETWDlg::PreprocessTrace(const std::wstring& traceFilename)
 {
 	if (bChromeDeveloper_)
 	{
-		IdentifyChromeProcesses(traceFilename);
+		IdentifyChromeProcesses(traceFilename, bIdentifyChromeProcessesCPU_);
 	}
 }
 
@@ -2023,8 +2395,8 @@ void CUIforETWDlg::PreprocessTrace(const std::wstring& traceFilename)
 void CUIforETWDlg::StartRenameTrace(bool fullRename)
 {
 	SaveNotesIfNeeded();
-	int curSel = btTraces_.GetCurSel();
-	if (curSel >= 0 && curSel < (int)traces_.size())
+	const int curSel = btTraces_.GetCurSel();
+	if (curSel >= 0 && curSel < static_cast<int>(traces_.size()))
 	{
 		std::wstring traceName = traces_[curSel];
 		// If the trace name starts with the default date/time pattern
@@ -2036,7 +2408,7 @@ void CUIforETWDlg::StartRenameTrace(bool fullRename)
 			validRenameDate_ = true;
 			for (size_t i = 0; i < kPrefixLength; ++i)
 			{
-				wchar_t c = traceName[i];
+				const wchar_t c = traceName[i];
 				if (c != '-' && c != '_' && c != '.' && !iswdigit(c))
 					validRenameDate_ = false;
 			}

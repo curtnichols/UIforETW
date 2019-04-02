@@ -36,7 +36,7 @@ enum TracingMode
 class CUIforETWDlg : public CDialog
 {
 public:
-	CUIforETWDlg(CWnd* pParent = NULL);	// standard constructor
+	CUIforETWDlg(CWnd* pParent = NULL) noexcept;	// standard constructor
 	~CUIforETWDlg();
 
 // Dialog Data
@@ -47,9 +47,16 @@ public:
 private:
 	virtual void DoDataExchange(CDataExchange* pDX) override;	// DDX/DDV support
 
+	CUIforETWDlg(const CUIforETWDlg&) = delete;
+	CUIforETWDlg(const CUIforETWDlg&&) = delete;
+	CUIforETWDlg& operator=(const CUIforETWDlg&) = delete;
+	CUIforETWDlg& operator=(const CUIforETWDlg&&) = delete;
+
 	HICON m_hIcon;
 
 	bool bIsTracing_ = false;
+	// This tracks whether GetFinalImageTraceFile() was recorded to.
+	bool bPreTraceRecorded_ = false;
 	ULONGLONG traceStartTime_ = 0;
 	// Auto-save trace if tracing to a file runs for longer than this length of time.
 	// Otherwise the trace files can fill hard drives and be unusably large.
@@ -102,7 +109,7 @@ private:
 	TracingMode tracingMode_ = kTracingToMemory;
 	// Increase the buffer count by some proportion when tracing to a file
 	// on a large-memory machine.
-	int BufferCountBoost(int requestCount) const;
+	int BufferCountBoost(int requestCount) const noexcept;
 	CComboBox btTracingMode_;
 	std::wstring heapTracingExes_ = L"chrome.exe";
 	void SetHeapTracing(bool forceOff);
@@ -145,7 +152,6 @@ private:
 	// this string object, so don't change it without adding synchronization.
 	std::wstring traceDir_;
 	std::wstring tempTraceDir_;
-	std::wstring windowsKitsDir_; // C:\\Program Files (x86)\\Windows Kits
 	std::wstring wpt81Dir_; // This points to the WPT 8.1 directory if it exists, else nothing.
 	std::wstring wpt10Dir_; // If WPT 10 isn't installed UIforETW will exit.
 	std::wstring wpa81Path_;
@@ -175,6 +181,7 @@ private:
 	HACCEL hTracesAccelTable_ = NULL;
 
 	void SetSamplingSpeed();
+	void CheckSymbolDLLs();
 
 	// Stop tracing (if tracing to a file or if bSaveTrace is
 	// false), saving the trace as well if bSaveTrace is true.
@@ -187,19 +194,30 @@ private:
 	// the same result across multiple calls!
 	std::wstring GenerateResultFilename() const;
 	std::wstring GetTempTraceDir() const { return tempTraceDir_; }
-	std::wstring GetKernelFile() const { return CUIforETWDlg::GetTempTraceDir() + L"kernel.etl"; }
-	std::wstring GetUserFile() const { return GetTempTraceDir() + L"user.etl"; }
-	std::wstring GetHeapFile() const { return GetTempTraceDir() + L"heap.etl"; }
+	std::wstring GetKernelFile() const { return CUIforETWDlg::GetTempTraceDir() + L"UIForETWkernel.etl"; }
+	std::wstring GetUserFile() const { return GetTempTraceDir() + L"UIForETWuser.etl"; }
+	std::wstring GetHeapFile() const { return GetTempTraceDir() + L"UIForETWheap.etl"; }
+	// Trace files for recording binary image data at the start of tracing.
+	std::wstring GetTempImageTraceFile() const { return GetTempTraceDir() + L"UIForETWTempPretraceImages.etl"; }
+	std::wstring GetFinalImageTraceFile() const { return GetTempTraceDir() + L"UIForETWPretraceImages.etl"; }
 
 	// Get session name for kernel logger
-	const std::wstring kernelLogger_ = L"\"NT Kernel Logger\"";
-	//const std::wstring logger_ = L"\"Circular Kernel Context Logger\"";
-	std::wstring GetKernelLogger() const { return kernelLogger_; }
+	const std::wstring NTKernelLogger_ = L"\"NT Kernel Logger\"";
+	const std::wstring CircularKernellogger_ = L"\"Circular Kernel Context Logger\"";
+	bool bUseOtherKernelLogger_ = false;
+	std::wstring GetKernelLogger() const { return bUseOtherKernelLogger_ ? CircularKernellogger_ : NTKernelLogger_; }
 
 	int initialWidth_ = 0;
 	int initialHeight_ = 0;
 	int lastWidth_ = 0;
 	int lastHeight_ = 0;
+	int minWidth_ = 0;
+	int minHeight_ = 0;
+	const int maxWidth_ = 3000;
+	const int maxHeight_ = 3000;
+	// Width and height persisted to settings
+	int previousWidth_ = 0;
+	int previousHeight_ = 0;
 
 	void SetSymbolPath();
 	// Call this to retrieve a directory from an environment variable, or use
@@ -216,19 +234,23 @@ private:
 	CToolTipCtrl toolTip_;
 
 	// Editable only by the settings dialog.
+	bool bBackgroundMonitoring_ = true;
 	bool bChromeDeveloper_ = false;
+	bool bIdentifyChromeProcessesCPU_ = false;
 	bool bAutoViewTraces_ = false;
+	bool bRecordPreTrace_ = false;
 	std::wstring extraKernelFlags_;
 	std::wstring extraKernelStacks_;
 	std::wstring extraUserProviders_;
+	std::wstring perfCounters_;
 
 	std::pair<uint64_t, uint64_t> CompressTrace(const std::wstring& tracePath) const;
 	void CompressAllTraces() const;
 	// Update the enabled/disabled states of buttons.
-	void UpdateEnabling();
+	void UpdateEnabling() noexcept;
 	void UpdateNotesState();
 	void StripChromeSymbols(const std::wstring& traceFilename);
-	void IdentifyChromeProcesses(const std::wstring& traceFilename);
+	void IdentifyChromeProcesses(const std::wstring& traceFilename, bool withCPU = false);
 	void PreprocessTrace(const std::wstring& traceFilename);
 	void CreateFlameGraph(const std::wstring& traceFilename);
 	void LaunchTraceViewer(const std::wstring traceFilename, const std::wstring viewerPath);
@@ -240,29 +262,29 @@ private:
 	virtual BOOL OnInitDialog() override;
 	afx_msg void OnSysCommand(UINT nID, LPARAM lParam);
 	afx_msg void OnPaint();
-	afx_msg HCURSOR OnQueryDragIcon();
+	afx_msg HCURSOR OnQueryDragIcon() noexcept;
 	DECLARE_MESSAGE_MAP()
 	afx_msg void OnBnClickedStarttracing();
 	afx_msg void OnBnClickedStoptracing();
-	afx_msg void OnBnClickedCompresstrace();
-	afx_msg void OnBnClickedCpusamplingcallstacks();
-	afx_msg void OnBnClickedContextswitchcallstacks();
-	afx_msg void OnBnClickedShowcommands();
+	afx_msg void OnBnClickedCompresstrace() noexcept;
+	afx_msg void OnBnClickedCpusamplingcallstacks() noexcept;
+	afx_msg void OnBnClickedContextswitchcallstacks() noexcept;
+	afx_msg void OnBnClickedShowcommands() noexcept;
 	afx_msg void OnBnClickedFastsampling();
 	afx_msg void OnCbnSelchangeInputtracing();
 	afx_msg LRESULT UpdateTraceListHandler(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT NewVersionAvailable(WPARAM wParam, LPARAM lParam);
 	afx_msg void OnLbnDblclkTracelist();
-	afx_msg void OnGetMinMaxInfo(MINMAXINFO* lpMMI);
+	afx_msg void OnGetMinMaxInfo(MINMAXINFO* lpMMI) noexcept;
 	afx_msg void OnSize(UINT, int, int);
 	afx_msg void OnLbnSelchangeTracelist();
 	afx_msg void OnBnClickedAbout();
 	afx_msg void OnBnClickedSavetracebuffers();
 	afx_msg LRESULT OnHotKey(WPARAM wParam, LPARAM lParam);
-	afx_msg BOOL PreTranslateMessage(MSG* pMsg);
+	afx_msg BOOL PreTranslateMessage(MSG* pMsg) override;
 	afx_msg void OnClose(); 
-	afx_msg void OnCancel();
-	afx_msg void OnOK();
+	afx_msg void OnCancel() override;
+	afx_msg void OnOK() override;
 	afx_msg void OnCbnSelchangeTracingmode();
 	afx_msg void OnBnClickedSettings();
 	afx_msg void OnContextMenu(CWnd* pWnd, CPoint point);
@@ -280,6 +302,6 @@ private:
 	afx_msg void OnActivate(UINT nState, CWnd* pWndOther, BOOL bMinimized);
 	afx_msg void OnTimer(UINT_PTR nIDEvent);
 public:
-	afx_msg void OnBnClickedGPUtracing();
-	afx_msg void OnBnClickedClrtracing();
+	afx_msg void OnBnClickedGPUtracing() noexcept;
+	afx_msg void OnBnClickedClrtracing() noexcept;
 };
